@@ -77,46 +77,6 @@ jobs:
             gh pr edit $PR_NUMBER --add-label "approved"
           fi
 
-      - name: request for review
-        run: |
-          AUTHOR=${{ github.event.pull_request.user.login }}
-          REPO_NAME=${{ github.repository }}
-
-          # request two reviewers from OWNERS file randomly
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          REVIEWERS=$(
-            yq -r '.reviewers[]' OWNERS \
-              | sed 's/^[ \t]*//;s/[ \t]*$//' \
-              | tr -d '\r' \
-              | grep -v "^${AUTHOR}$" \
-              | shuf \
-              | head -n 2 \
-              | paste -sd ","
-          )
-          if [ -n "$REVIEWERS" ]; then
-            # Get current reviewers to append instead of replace
-            current_reviewers=$(gh api "/repos/${REPO_NAME}/pulls/${PR_NUMBER}" --jq '.requested_reviewers[].login')
-            all_reviewers=()
-
-            for reviewer in $current_reviewers; do
-              echo "current reviewer: $reviewer"
-              all_reviewers+=("$reviewer")
-            done
-
-            IFS=',' read -ra new_reviewers <<< "$REVIEWERS"
-            for reviewer in "${new_reviewers[@]}"; do
-              echo "to add reviewer: $reviewer"
-              all_reviewers+=("$reviewer")
-            done
-
-            REVIEWERS_ARGS=""
-            for user in "${all_reviewers[@]}"; do
-              REVIEWERS_ARGS+="-f reviewers[]=$user "
-            done
-
-            gh api -X POST "/repos/${REPO_NAME}/pulls/${PR_NUMBER}/requested_reviewers" ${REVIEWERS_ARGS}
-          fi
-
   # Work for issue & PR, ignore update for now
   on-new-comment:
     if: (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') && github.event.action == 'created'

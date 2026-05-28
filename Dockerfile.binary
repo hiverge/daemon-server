@@ -1,0 +1,20 @@
+# Dockerfile for hive-webserver binary container
+# This creates a minimal image containing just the binary for use as an init container
+#
+# Build: docker build -f Dockerfile.binary -t your-registry/hive-webserver-binary:v1 .
+# Usage: Used as init container to inject binary into user's sandbox pods
+
+FROM scratch
+
+# Copy the pre-built binary
+COPY dist/hive-webserver /hive-webserver
+
+# This image is meant to be used as init container source
+# Example usage in pod:
+# initContainers:
+# - name: inject-webserver
+#   image: your-registry/hive-webserver-binary:v1
+#   command: ["cp", "/hive-webserver", "/shared/bin/"]
+#   volumeMounts:
+#   - name: shared-bin
+#     mountPath: /shared/bin
