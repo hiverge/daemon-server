@@ -1,0 +1,525 @@
+# Inspired by https://github.com/kerthcet/github-workflow-as-kube.
+name: Event Workflow
+
+on:
+  issues:
+    types:
+      - opened
+  issue_comment:
+    types:
+      - created
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - labeled
+      - unlabeled
+
+env:
+  GH_TOKEN: ${{ secrets.AGENT_TOKEN }}
+  GH_DEBUG: api
+
+jobs:
+  on-new-push:
+    if: github.event_name == 'pull_request_target' && github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Remove lgtm label on new push
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+
+          if [ -z "$PR_NUMBER" ]; then
+           echo "No PR number found in push event context."
+            exit 0
+          fi
+
+          if gh pr view $PR_NUMBER --json labels --jq '.labels[].name' | grep -q "lgtm"; then
+            gh pr edit $PR_NUMBER --remove-label lgtm
+            echo "Removed 'lgtm' label due to new push."
+          fi
+
+  on-issue-opened:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Issue information
+        run: |
+          PR_NUMBER=$(jq -r '.issue.number' $GITHUB_EVENT_PATH)
+          gh issue edit $PR_NUMBER --add-label "needs-triage,needs-priority"
+
+  on-pr-opened:
+    if: github.event_name == 'pull_request_target' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: pip install yq
+
+      - name: Issue information
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          AUTHOR=${{ github.event.pull_request.user.login }}
+
+          gh pr edit $PR_NUMBER --add-label "needs-triage,needs-priority,do-not-merge/needs-kind"
+
+          if yq ".approvers[] | select(. == \"$AUTHOR\") " OWNERS | grep -q "$AUTHOR"; then
+            gh pr edit $PR_NUMBER --add-label "approved"
+          fi
+
+      - name: request for review
+        run: |
+          AUTHOR=${{ github.event.pull_request.user.login }}
+          REPO_NAME=${{ github.repository }}
+
+          # request two reviewers from OWNERS file randomly
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REVIEWERS=$(
+            yq -r '.reviewers[]' OWNERS \
+              | sed 's/^[ \t]*//;s/[ \t]*$//' \
+              | tr -d '\r' \
+              | grep -v "^${AUTHOR}$" \
+              | shuf \
+              | head -n 2 \
+              | paste -sd ","
+          )
+          if [ -n "$REVIEWERS" ]; then
+            # Get current reviewers to append instead of replace
+            current_reviewers=$(gh api "/repos/${REPO_NAME}/pulls/${PR_NUMBER}" --jq '.requested_reviewers[].login')
+            all_reviewers=()
+
+            for reviewer in $current_reviewers; do
+              echo "current reviewer: $reviewer"
+              all_reviewers+=("$reviewer")
+            done
+
+            IFS=',' read -ra new_reviewers <<< "$REVIEWERS"
+            for reviewer in "${new_reviewers[@]}"; do
+              echo "to add reviewer: $reviewer"
+              all_reviewers+=("$reviewer")
+            done
+
+            REVIEWERS_ARGS=""
+            for user in "${all_reviewers[@]}"; do
+              REVIEWERS_ARGS+="-f reviewers[]=$user "
+            done
+
+            gh api -X POST "/repos/${REPO_NAME}/pulls/${PR_NUMBER}/requested_reviewers" ${REVIEWERS_ARGS}
+          fi
+
+  # Work for issue & PR, ignore update for now
+  on-new-comment:
+    if: (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') && github.event.action == 'created'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install yq
+        run: pip install yq
+
+      - name: Handle Comments
+        run: |
+          COMMENT_BODY=$(jq -r '.comment.body' $GITHUB_EVENT_PATH)
+          ISSUE_NUMBER=$(jq -r '.issue.number' $GITHUB_EVENT_PATH)
+          COMMENT_USER=$(jq -r '.comment.user.login' $GITHUB_EVENT_PATH)
+          REPO_NAME=$(jq -r '.repository.full_name' $GITHUB_EVENT_PATH)
+          EVENT_TYPE=""
+
+          if [[ "${{ github.event.issue.pull_request }}" != "" ]]; then
+            EVENT_TYPE="pr"
+          else
+            EVENT_TYPE="issue"
+          fi
+
+          # Initialize arrays to store the labels.
+          LABELS_TO_ADD=()
+          LABELS_TO_REMOVE=()
+          ASSIGNEES_TO_ADD=()
+          ASSIGNEES_TO_REMOVE=()
+          REVIEWERS_TO_ADD=()
+          REVIEWERS_TO_REMOVE=()
+
+          while IFS= read -r COMMENT_LINE; do
+            COMMENT_LINE=$(echo "$COMMENT_LINE" | sed 's/^[ \t]*//;s/[ \t]*$//' | tr -d '\r\n' | awk '{$1=$1};1')
+            LABEL=$(echo "$COMMENT_LINE" | awk '{print $2}')
+            REMAINING_CONTENT=$(echo "$COMMENT_LINE" | awk '{ $1=""; print substr($0,2) }')
+
+            if [[ ! "$COMMENT_LINE" =~ ^/ ]]; then
+              continue
+            fi
+
+            # Handle PR only.
+            if [ "$EVENT_TYPE" == "pr" ]; then
+
+              # Handle lgtm command
+              if [[ "$COMMENT_LINE" =~ ^/lgtm ]]; then
+                if [[ "$LABEL" =~ ^cancel ]]; then
+                  LABELS_TO_REMOVE+=("lgtm")
+                  ASSIGNEES_TO_REMOVE+=("$COMMENT_USER")
+                  echo "To remove label: lgtm"
+                else
+                  LABELS_TO_ADD+=("lgtm")
+                  ASSIGNEES_TO_ADD+=("$COMMENT_USER")
+                  echo "To add label: lgtm"
+                fi
+
+              # Handle approved command
+              elif [[ "$COMMENT_LINE" =~ ^/approve ]]; then
+                if yq ".approvers[] | select(. == \"$COMMENT_USER\") " OWNERS | grep -q "$COMMENT_USER"; then
+                  if [[ "$LABEL" =~ ^cancel ]]; then
+                    LABELS_TO_REMOVE+=("approved")
+                    echo "To remove label: approved"
+                  else
+                    LABELS_TO_ADD+=("approved")
+                    echo "To add label: approved"
+                  fi
+                else
+                  gh pr comment $ISSUE_NUMBER --body "Sorry, @$COMMENT_USER is not authorized to approve/unapprove this PR."
+                  echo "User $COMMENT_USER is not authorized to approve/unapprove this PR"
+                fi
+
+              # Handle hold command
+              # hold/unhold the PR immediately in case of unexpected auto-merge.
+              elif [[ "$COMMENT_LINE" =~ ^/hold ]]; then
+                gh pr edit $ISSUE_NUMBER --add-label do-not-merge/hold
+                echo "Add label: do-not-merge/hold"
+              elif [[ "$COMMENT_LINE" =~ ^/unhold ]]; then
+                gh pr edit $ISSUE_NUMBER --remove-label do-not-merge/hold
+                echo "Remove label: do-not-merge/hold"
+
+              # Handle cc
+              # Can not require review from the author.
+              elif [[ "$COMMENT_LINE" =~ ^/cc ]]; then
+                USERNAME=$(echo "$LABEL" | sed 's/@//')
+                if [[ -n "$USERNAME" ]]; then
+                  REVIEWERS_TO_ADD+=("$USERNAME")
+                  echo "To require review from $USERNAME"
+                else
+                  REVIEWERS_TO_ADD+=("$COMMENT_USER")
+                  echo "To require review from $COMMENT_USER"
+                fi
+              elif [[ "$COMMENT_LINE" =~ ^/uncc ]]; then
+                USERNAME=$(echo "$LABEL" | sed 's/@//')
+                if [[ -n "$USERNAME" ]]; then
+                  REVIEWERS_TO_REMOVE+=("$USERNAME")
+                  echo "To remove review from $USERNAME"
+                else
+                  REVIEWERS_TO_REMOVE+=("$COMMENT_USER")
+                  echo "To remove review from $COMMENT_USER"
+                fi
+
+              # handle retest command
+              elif [[ "$COMMENT_LINE" =~ ^/retest ]]; then
+                BRANCH_NAME=$(gh pr view $ISSUE_NUMBER --json headRefName -q '.headRefName')
+
+                id=$(gh run list --branch $BRANCH_NAME --limit 10 --json databaseId,status,conclusion,name | jq -r '.[] | select(.conclusion=="failure" and .name=="CI Workflow") | .databaseId' | head -n 1)
+                echo "The failed CI workflow: $id"
+                if [[ "$COMMENT_LINE" == "/retest" ]]; then
+                    gh run rerun $id --failed
+                else
+                    gh run rerun $id
+                fi
+
+              else
+                echo "$COMMENT_LINE is not for PR type only, fall back to normal handler"
+              fi
+            fi
+
+            # Handle kind command
+            if [[ "$COMMENT_LINE" =~ ^/kind ]]; then
+              if [[ "$LABEL" =~ ^lgtm || "$LABEL" =~ ^approve ]]; then
+                echo "The label '$LABEL' cannot be added using /kind."
+              else
+                LABELS_TO_ADD+=("$LABEL")
+                echo "To add label: '$LABEL'"
+                LABELS_TO_REMOVE+=("needs-kind")
+                LABELS_TO_REMOVE+=("do-not-merge/needs-kind")
+              fi
+            elif [[ "$COMMENT_LINE" =~ ^/remove-kind ]]; then
+              if [[ "$LABEL" =~ ^lgtm || "$LABEL" =~ ^approve ]]; then
+                echo "The label '$LABEL' cannot be removed using /remove-kind."
+              else
+                LABELS_TO_REMOVE+=("$LABEL")
+                echo "To remove label: '$LABEL'"
+              fi
+
+            # Handle triage
+            elif [[ "$COMMENT_LINE" =~ ^/wip || "COMMENT_LINE" =~  ^/WIP ]]; then
+              if [[ "$LABEL" =~ ^cancel ]]; then
+                LABELS_TO_REMOVE+=("do-not-merge/work-in-progress")
+              else
+                LABELS_TO_ADD+=("do-not-merge/work-in-progress")
+              fi
+
+            # Handle triage
+            elif [[ "$COMMENT_LINE" =~ ^/triage ]]; then
+              if [[ "$LABEL" =~ ^accepted ]]; then
+                LABELS_TO_ADD+=("triage/accepted")
+                LABELS_TO_REMOVE+=("needs-triage")
+                LABELS_TO_REMOVE+=("triage/needs-information")
+              elif [[ "$LABEL" =~ ^needs-information ]]; then
+                LABELS_TO_ADD+=("triage/needs-information")
+              fi
+
+            # Handle assignment
+            elif [[ "$COMMENT_LINE" =~ ^/assign ]]; then
+              USERNAME=$(echo "$LABEL" | sed 's/@//')
+              if [[ -n "$USERNAME" ]]; then
+                ASSIGNEES_TO_ADD+=("$USERNAME")
+                echo "To assign to $USERNAME"
+              else
+                ASSIGNEES_TO_ADD+=("$COMMENT_USER")
+                echo "To assign to $COMMENT_USER"
+              fi
+            elif [[ "$COMMENT_LINE" =~ ^/unassign ]]; then
+              USERNAME=$(echo "$LABEL" | sed 's/@//')
+              if [[ -n "$USERNAME" ]]; then
+                ASSIGNEES_TO_REMOVE+=("$USERNAME")
+                echo "To unassign to $USERNAME"
+              else
+                ASSIGNEES_TO_REMOVE+=("$COMMENT_USER")
+                echo "To unassign to $COMMENT_USER"
+              fi
+
+            # Handle help & good-first-issue
+            elif [[ "$COMMENT_LINE" =~ ^/help ]]; then
+              LABELS_TO_ADD+=("help wanted")
+            elif [[ "$COMMENT_LINE" =~ ^/remove-help ]]; then
+              LABELS_TO_REMOVE+=("help wanted")
+            elif [[ "$COMMENT_LINE" =~ ^/good-first-issue ]]; then
+              LABELS_TO_ADD+=("good first issue")
+            elif [[ "$COMMENT_LINE" =~ ^/remove-good-first-issue ]]; then
+              LABELS_TO_REMOVE+=("good first issue")
+            elif [[ "$COMMENT_LINE" =~ ^/retitle ]]; then
+              gh "$EVENT_TYPE" edit $ISSUE_NUMBER --title "$REMAINING_CONTENT"
+            elif [[ "$COMMENT_LINE" =~ ^/reopen ]]; then
+              gh "$EVENT_TYPE" reopen $ISSUE_NUMBER
+            elif [[ "$COMMENT_LINE" =~ ^/close ]]; then
+              gh "$EVENT_TYPE" close $ISSUE_NUMBER
+
+            # Handle priority
+            elif [[ "$COMMENT_LINE" =~ ^/priority ]]; then
+              LABELS_TO_ADD+=("$LABEL")
+              LABELS_TO_REMOVE+=("needs-priority")
+            elif [[ "$COMMENT_LINE" =~ ^/remove-priority ]]; then
+              LABELS_TO_REMOVE+=("$LABEL")
+
+            # Handle milestone
+            elif [[ "$COMMENT_LINE" =~ ^/milestone ]]; then
+              if [[ "$LABEL" =~ ^clear ]]; then
+                gh "$EVENT_TYPE" edit $ISSUE_NUMBER --milestone ""
+              else
+                gh "$EVENT_TYPE" edit $ISSUE_NUMBER --milestone "$LABEL"
+              fi
+
+            fi
+          done <<< "$COMMENT_BODY"
+
+          # Convert array to comma-separated strings.
+          LABELS_TO_ADD_STR=$(IFS=,; echo "${LABELS_TO_ADD[*]}")
+          LABELS_TO_REMOVE_STR=$(IFS=,; echo "${LABELS_TO_REMOVE[*]}")
+          ASSIGNEES_TO_ADD_STR=$(IFS=,; echo "${ASSIGNEES_TO_ADD[*]}")
+          ASSIGNEES_TO_REMOVE_STR=$(IFS=,; echo "${ASSIGNEES_TO_REMOVE[*]}")
+          REVIEWERS_TO_ADD_STR=$(IFS=,; echo "${REVIEWERS_TO_ADD[*]}")
+          REVIEWERS_TO_REMOVE_STR=$(IFS=,; echo "${REVIEWERS_TO_REMOVE[*]}")
+
+          if [[ -n "$LABELS_TO_ADD_STR" ]]; then
+            gh "$EVENT_TYPE" edit $ISSUE_NUMBER --add-label "$LABELS_TO_ADD_STR"
+          fi
+
+          if [[ -n "$LABELS_TO_REMOVE_STR" ]]; then
+            gh "$EVENT_TYPE" edit $ISSUE_NUMBER --remove-label "$LABELS_TO_REMOVE_STR"
+          fi
+
+          if [[ -n "$ASSIGNEES_TO_ADD_STR" ]]; then
+            # See related issue: https://github.com/kerthcet/github-workflow-as-kube/issues/7
+            # gh "$EVENT_TYPE" edit $ISSUE_NUMBER --add-assignee "$ASSIGNEES_TO_ADD_STR"
+
+            current_assignees=$(gh api "/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}" --jq '.assignees[].login')
+            all_assignees=()
+
+            for assignee in $current_assignees; do
+              echo "current assignee: $assignee"
+              all_assignees+=("$assignee")
+            done
+
+            for assignee in "${ASSIGNEES_TO_ADD[@]}"; do
+              echo "to add assignee: $assignee"
+              all_assignees+=("$assignee")
+            done
+
+            for user in "${all_assignees[@]}"; do
+              ASSIGNEES_ARGS+="-f "assignees[]=$user" "
+            done
+
+            # for user in "${ASSIGNEES_TO_ADD[@]}"; do
+            #   ASSIGNEES_ARGS+="-f "assignees[]=$user" "
+            # done
+            gh api -X PATCH "/repos/${REPO_NAME}/issues/${ISSUE_NUMBER}" ${ASSIGNEES_ARGS}
+          fi
+
+          if [[ -n "$ASSIGNEES_TO_REMOVE_STR" ]]; then
+            gh "$EVENT_TYPE" edit $ISSUE_NUMBER --remove-assignee "$ASSIGNEES_TO_REMOVE_STR"
+          fi
+
+          if [ "$EVENT_TYPE" == "pr" ]; then
+            if [[ -n "$REVIEWERS_TO_ADD_STR" ]]; then
+              # Get current reviewers to append instead of replace
+              current_reviewers=$(gh api "/repos/${REPO_NAME}/pulls/${ISSUE_NUMBER}" --jq '.requested_reviewers[].login')
+              all_reviewers=()
+
+              for reviewer in $current_reviewers; do
+                echo "current reviewer: $reviewer"
+                all_reviewers+=("$reviewer")
+              done
+
+              for reviewer in "${REVIEWERS_TO_ADD[@]}"; do
+                echo "to add reviewer: $reviewer"
+                all_reviewers+=("$reviewer")
+              done
+
+              REVIEWERS_ARGS=""
+              for user in "${all_reviewers[@]}"; do
+                REVIEWERS_ARGS+="-f reviewers[]=$user "
+              done
+
+              gh api -X POST "/repos/${REPO_NAME}/pulls/${ISSUE_NUMBER}/requested_reviewers" ${REVIEWERS_ARGS}
+            fi
+
+            # This is not work due to gh issue, see https://github.com/orgs/community/discussions/23054
+            if [[ -n "$REVIEWERS_TO_REMOVE_STR" ]]; then
+              gh pr edit $ISSUE_NUMBER --remove-reviewer "$REVIEWERS_TO_REMOVE_STR"
+            fi
+          fi
+
+  auto-merge:
+    if: (github.event_name == 'pull_request_target' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.pull_request.merged == false) || (github.event_name == 'issue_comment' && github.event.issue.pull_request != null && github.event.issue.state == 'open' && contains(github.event.comment.body, '/retest'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check lgtm and approved
+        id: check_label
+        run: |
+          if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            PR_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          else
+            PR_NUMBER=${{ github.event.pull_request.number }}
+          fi
+
+          LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+          if [[ "$LABELS" == *"lgtm"* && "$LABELS" == *"approved"* && "$LABELS" != *"do-not-merge"* ]]; then
+            echo "Ready to merge"
+            echo "::set-output name=ready::true"
+          else
+            echo "Not ready to merge"
+            echo "::set-output name=ready::false"
+          fi
+
+      - name: Check PR Status
+        id: check_status
+        if: steps.check_label.outputs.ready == 'true'
+        run: |
+          #!/bin/bash
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          MAX_ATTEMPTS=360 # 30 minutes
+          SLEEP_INTERVAL=5
+          STATUS=""
+
+          LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+          if ![[ "$LABELS" == *"lgtm"* && "$LABELS" == *"approved"* && "$LABELS" != *"do-not-merge"* ]]; then
+            exit 0
+          fi
+
+          check_status() {
+            CHECKS=$(gh pr checks $PR_NUMBER --repo $REPO --json state)
+
+            SUCCESS_COUNT=$(echo "$CHECKS" | jq '[.[] | select(.state == "SUCCESS")] | length')
+            FAILURE_COUNT=$(echo "$CHECKS" | jq '[.[] | select(.state == "FAILURE")] | length')
+            SKIPPED_COUNT=$(echo "$CHECKS" | jq '[.[] | select(.state == "SKIPPED")] | length')
+            QUEUED_COUNT=$(echo "$CHECKS" | jq '[.[] | select(.state == "QUEUED")] | length')
+            WIP_COUNT=$(echo "$CHECKS" | jq '[.[] | select(.state == "IN_PROGRESS")] | length')
+
+            # 1 means the auto-merge itself.
+            if [ $WIP_COUNT -eq 1 ] && [ $FAILURE_COUNT -eq 0 ] && [ $QUEUED_COUNT -eq 0 ]; then
+              STATUS=0
+              echo "All checks passed or skipped."
+            elif [ $FAILURE_COUNT -gt 0 ]; then
+              STATUS=1
+              echo "Some checks failed."
+            else
+              STATUS=2
+              echo "Some checks are still in progress."
+            fi
+          }
+
+          attempt=0
+          while [ $attempt -lt $MAX_ATTEMPTS ]; do
+            check_status
+            echo "STATUS: $STATUS"
+
+            if [ $STATUS -eq 0 ]; then
+              echo "Checks passed. Proceeding with merge."
+              echo "::set-output name=ready::true"
+              exit 0
+            elif [ $STATUS -eq 1 ]; then
+              echo "Checks failed. Exiting."
+              echo "::set-output name=ready::false"
+              exit 1
+            else
+              echo "Waiting for checks to complete..."
+              sleep $SLEEP_INTERVAL
+              attempt=$((attempt + 1))
+            fi
+          done
+
+          echo "Max attempts reached. Some checks are still in progress. Exiting."
+          echo "::set-output name=ready::false"
+          exit 1
+
+      - name: Auto-merge
+        if: steps.check_label.outputs.ready == 'true' && steps.check_status.outputs.ready == 'true'
+        run: |
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO_NAME=${{ github.repository }}
+          LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+          TITLE=$(gh pr view $PR_NUMBER --json title --jq '.title')
+
+          echo "Merging PR: $PR_NUMBER"
+
+          # Check again just in case labels removed during waiting time.
+          if [[ "$LABELS" == *"lgtm"* && "$LABELS" == *"approved"* && "$LABELS" != *"do-not-merge"* ]]; then
+            # Create GitHub approval review if both lgtm and approved labels exist
+            EXISTING_APPROVALS=$(gh api "/repos/${REPO_NAME}/pulls/${PR_NUMBER}/reviews" --jq '[.[] | select(.state == "APPROVED")] | length')
+            if [ "$EXISTING_APPROVALS" -eq 0 ]; then
+              gh api -X POST "/repos/${REPO_NAME}/pulls/${PR_NUMBER}/reviews" \
+                -f event="APPROVE" \
+                -f body="Approved: PR has both lgtm and approved labels"
+              echo "Created GitHub approval review (lgtm + approved)"
+            else
+              echo "GitHub approval review already exists, skipping"
+            fi
+
+            gh pr merge $PR_NUMBER --squash
+            echo "Auto merged"
+          fi
