@@ -13,8 +13,8 @@ from typing import Optional
 import common_tools
 from flask import Flask, jsonify, request
 
-REPO_DIR = "/app/"  # Directory where the repository is mounted
-BACKUP_DIR = "/.backup/"  # Backup directory to restore original state
+REPO_DIR = os.environ.get("REPO_DIR", "/app/")  # Directory where the repository is mounted
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/.backup/")  # Backup directory to restore original state
 
 app = Flask(__name__)
 sandbox_lock = threading.Lock()

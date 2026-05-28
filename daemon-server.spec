@@ -21,7 +21,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='hive-webserver',
+    name='daemon-server',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

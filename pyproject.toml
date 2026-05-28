@@ -1,11 +1,12 @@
 [project]
-name = "python-sandbox-server"
+name = "daemon-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "Standalone daemon server for executing code and health checks in sandbox containers"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
-  "flask==3.1.3",
-  "requests",
-  "psutil"
+  "flask>=3.0.0",
+  "waitress>=3.0.0",
+  "requests>=2.31.0",
+  "psutil>=5.9.0"
 ]

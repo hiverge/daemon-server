@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Build and release hive-webserver binary to GitHub Releases
+# Build and release daemon-server binary to GitHub Releases
 # This makes the binary publicly accessible via HTTPS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +18,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 echo "=========================================="
-echo "Building and Releasing Webserver Binary"
+echo "Building and Releasing Daemon Server Binary"
 echo "Version: $VERSION"
 echo "=========================================="
 
@@ -47,8 +47,8 @@ else
 fi
 
 # Check if binary exists
-if [ ! -f dist/hive-webserver ]; then
-    echo "ERROR: Binary not found at dist/hive-webserver"
+if [ ! -f dist/daemon-server ]; then
+    echo "ERROR: Binary not found at dist/daemon-server"
     echo "Run build-binary.sh first or set SKIP_BUILD=false"
     exit 1
 fi
@@ -57,9 +57,9 @@ fi
 echo ""
 echo "Step 2: Generating checksum..."
 cd dist
-sha256sum hive-webserver > hive-webserver.sha256
-SHA256=$(cat hive-webserver.sha256 | cut -d' ' -f1)
-SIZE=$(du -h hive-webserver | cut -f1)
+sha256sum daemon-server > daemon-server.sha256
+SHA256=$(cat daemon-server.sha256 | cut -d' ' -f1)
+SIZE=$(du -h daemon-server | cut -f1)
 cd ..
 
 echo "  Binary size: $SIZE"
@@ -77,8 +77,8 @@ if gh release view "$VERSION" &> /dev/null; then
     else
         echo "  Uploading to existing release..."
         gh release upload "$VERSION" \
-            dist/hive-webserver \
-            dist/hive-webserver.sha256 \
+            dist/daemon-server \
+            dist/daemon-server.sha256 \
             --clobber
 
         echo ""
@@ -86,10 +86,7 @@ if gh release view "$VERSION" &> /dev/null; then
         echo "SUCCESS! Binary updated in release"
         echo "=========================================="
         echo "Download URL:"
-        echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/hive-webserver"
-        echo ""
-        echo "Checksum URL:"
-        echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/hive-webserver.sha256"
+        echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server"
         echo ""
         echo "SHA256: $SHA256"
         exit 0
@@ -100,10 +97,10 @@ fi
 echo ""
 echo "Step 4: Creating GitHub release..."
 gh release create "$VERSION" \
-    dist/hive-webserver \
-    dist/hive-webserver.sha256 \
-    --title "Hive Webserver Binary $VERSION" \
-    --notes "**Hive Webserver Binary for Linux AMD64**
+    dist/daemon-server \
+    dist/daemon-server.sha256 \
+    --title "Daemon Server Binary $VERSION" \
+    --notes "**Daemon Server Binary for Linux AMD64**
 
 Size: $SIZE
 SHA256: \`$SHA256\`
@@ -112,23 +109,26 @@ SHA256: \`$SHA256\`
 
 \`\`\`bash
 # Download binary
-curl -L -o hive-webserver \\
-  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/hive-webserver
+curl -L -o daemon-server \\
+  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server
 
 # Verify checksum
-curl -L -o hive-webserver.sha256 \\
-  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/hive-webserver.sha256
-sha256sum -c hive-webserver.sha256
+curl -L -o daemon-server.sha256 \\
+  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server.sha256
+sha256sum -c daemon-server.sha256
 
 # Make executable
-chmod +x hive-webserver
+chmod +x daemon-server
 \`\`\`
 
 ## Usage
 
 \`\`\`bash
-# Run webserver
-PORT=8080 REPO_DIR=/app BACKUP_DIR=/.backup ./hive-webserver
+# Run daemon server with defaults (/app and /.backup directories)
+PORT=8080 ./daemon-server
+
+# Or specify custom directories
+PORT=8080 REPO_DIR=/custom/app BACKUP_DIR=/custom/backup ./daemon-server
 \`\`\`
 "
 
@@ -139,9 +139,6 @@ echo "=========================================="
 echo "View release: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/$VERSION"
 echo ""
 echo "Download URL:"
-echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/hive-webserver"
-echo ""
-echo "Use in Kubernetes:"
-echo "  export WEBSERVER_BINARY_URL=\"https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/hive-webserver\""
+echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server"
 echo ""
 echo "SHA256: $SHA256"

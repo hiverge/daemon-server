@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=========================================="
-echo "Building hive-webserver binary (linux/amd64)"
+echo "Building daemon-server binary (linux/amd64)"
 echo "=========================================="
 
 # Check if Docker is running
@@ -33,28 +33,28 @@ docker run --rm \
         apt-get install -y -qq binutils && \
         pip install -q pyinstaller flask requests psutil waitress && \
         echo 'Running PyInstaller...' && \
-        pyinstaller hive-webserver.spec && \
+        pyinstaller daemon-server.spec && \
         echo 'Build complete!'
     "
 
 # Check if build succeeded and rename with architecture
-if [ -f dist/hive-webserver ]; then
-    mv dist/hive-webserver dist/hive-webserver-linux-amd64
-    SIZE=$(du -h dist/hive-webserver-linux-amd64 | cut -f1)
+if [ -f dist/daemon-server ]; then
+    cp dist/daemon-server dist/daemon-server-linux-amd64
+    SIZE=$(du -h dist/daemon-server | cut -f1)
     echo ""
     echo "=========================================="
     echo "SUCCESS! Binary built successfully"
     echo "=========================================="
-    echo "Location: dist/hive-webserver-linux-amd64"
+    echo "Location: dist/daemon-server"
+    echo "Also saved as: dist/daemon-server-linux-amd64"
     echo "Size: $SIZE"
     echo "Platform: Linux x86_64 (amd64)"
     echo ""
     echo "Next steps:"
-    echo "1. Test locally: docker run --rm -v \$PWD/dist:/app alpine /app/hive-webserver"
-    echo "2. Build container: docker build -f Dockerfile.binary -t your-registry/hive-webserver:latest ."
-    echo "3. Deploy: kubectl apply -f ../../deploy/webserver-binary-configmap.yaml"
+    echo "1. Test locally: docker run --rm -v \$PWD/dist:/app alpine /app/daemon-server"
+    echo "2. Build container: docker build -f Dockerfile.binary -t your-registry/daemon-server:latest ."
 else
     echo ""
-    echo "ERROR: Build failed - binary not found at dist/hive-webserver"
+    echo "ERROR: Build failed - binary not found at dist/daemon-server"
     exit 1
 fi
