@@ -14,7 +14,7 @@ import common_tools
 from flask import Flask, jsonify, request
 
 REPO_DIR = os.environ.get("REPO_DIR", "/app/")  # Directory where the repository is mounted
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "/.backup/")  # Backup directory to restore original state
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/shared/repo/")  # Backup directory to restore original state
 
 app = Flask(__name__)
 sandbox_lock = threading.Lock()
@@ -62,9 +62,13 @@ def execute_python_function(
       f.write(range_and_content)
 
   # Run the Python program
+  # Use system python3 instead of sys.executable to avoid issues with PyInstaller bundles
+  # TODO: if people write evaluation_script with a different language extension,
+  # we should detect that and choose the right executable (e.g. node for .js)
+  python_executable = os.environ.get("PYTHON_EXECUTABLE", "python3")
   try:
     output = common_tools.run_command(
-      [sys.executable, evaluation_script] + args, REPO_DIR, timeout
+      [python_executable, evaluation_script] + args, REPO_DIR, timeout
     )
     return output
   except common_tools.FunctionExecutionError as e:
@@ -254,7 +258,7 @@ def run_shell():
       return jsonify(
         {"output": None, "metainfo": "Content-Type must be application/json"}
       ), 400
-    
+
     # Get data and validate required fields
     data = request.get_json()
     missing_fields = [
