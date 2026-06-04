@@ -49,7 +49,7 @@ def run_command(
       if process.returncode < 0:
         raise FunctionExecutionError(error_code_to_string(-process.returncode))
       if process.returncode != 0:
-        raise FunctionExecutionError(f"Error: {stderr}")
+        raise FunctionExecutionError(f"Error: {stdout}\n{stderr}")
       return stdout.strip().splitlines()[-1]  # Return only the last line of output
     except subprocess.TimeoutExpired as exc:
       process.kill()
