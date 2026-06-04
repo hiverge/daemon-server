@@ -15,6 +15,7 @@ from flask import Flask, jsonify, request
 
 REPO_DIR = os.environ.get("REPO_DIR", "/app/")  # Directory where the repository is mounted
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/shared/repo/")  # Backup directory to restore original state
+TRACKING_GIT_DIR = os.environ.get("TRACKING_GIT_DIR", "/tmp/.agent_git")  # Git directory for tracking changes without affecting the actual repo
 
 app = Flask(__name__)
 sandbox_lock = threading.Lock()
@@ -133,31 +134,31 @@ def run_function():
     return jsonify({"output": None, "metainfo": "Internal server error"}), 500
 
 
-def init_git_tracking():
-  """Initialize git tracking in workspace to capture changes."""
-  workspace = Path(REPO_DIR)
-  git_dir = workspace / ".git"
+def _git(args: list[str]) -> list[str]:
+  """
+  Wrapper around git which uses an external git directory to track changes
+  without affecting the actual repo.
+  """
+  return ["git", "--git-dir", TRACKING_GIT_DIR, "--work-tree", REPO_DIR] + args
 
-  if git_dir.exists():
-    if git_dir.is_symlink():
-      git_dir.unlink()
-    elif git_dir.is_dir():
-      shutil.rmtree(git_dir)
-    else:
-      git_dir.unlink()
+
+def init_git_tracking():
+  """Initialize an external git tracking repo to capture workspace changes."""
+  tracking = Path(TRACKING_GIT_DIR)
+  if tracking.exists():
+    shutil.rmtree(tracking)
 
   commands = [
-    ["git", "init"],
-    ["git", "config", "user.email", "agent@docker"],
-    ["git", "config", "user.name", "Agent"],
-    ["git", "add", "-A"],
-    ["git", "commit", "-m", "Initial state before agent run", "--allow-empty"],
+    _git(["init"]),
+    _git(["config", "user.email", "agent@docker"]),
+    _git(["config", "user.name", "Agent"]),
+    _git(["add", "-A"]),
+    _git(["commit", "-m", "Initial state before agent run", "--allow-empty"]),
   ]
 
   for command in commands:
     result = subprocess.run(
       command,
-      cwd=REPO_DIR,
       capture_output=True,
       text=True,
     )
@@ -172,8 +173,7 @@ def get_changed_files():
   """Return a dict of {relative_path: content} for all files changed since init."""
   EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf899d15363d7d95d"
   initial_commit = subprocess.run(
-    ["git", "rev-list", "--max-parents=0", "HEAD"],
-    cwd=REPO_DIR,
+    _git(["rev-list", "--max-parents=0", "HEAD"]),
     capture_output=True,
     text=True,
   )
@@ -182,10 +182,9 @@ def get_changed_files():
   else:
     initial_sha = initial_commit.stdout.strip().split('\n')[0]
 
-  subprocess.run(["git", "add", "-A"], cwd=REPO_DIR, capture_output=True)
+  subprocess.run(_git(["add", "-A"]), capture_output=True)
   result = subprocess.run(
-    ["git", "diff", "--staged", "--name-only", initial_sha],
-    cwd=REPO_DIR,
+    _git(["diff", "--staged", "--name-only", initial_sha]),
     capture_output=True,
     text=True,
   )
