@@ -79,7 +79,7 @@ def execute_python_function(
     try:
       # If the script leaves checkpointed json data, find and return it
       output = common_tools.run_command(["cat", "checkpoint.json"], REPO_DIR)
-      return f'{{"output": {output}, "metainfo": "Checkpoint"}}'
+      return jsonify({"status": "success", "data": {"output": output, "metainfo": "Checkpoint"}}), 200
     except common_tools.FunctionExecutionError as ee:
       logger.info(
         "Failed to read checkpoint data: %s. Returning original error.", ee
@@ -103,7 +103,7 @@ def run_function():
     if not request.is_json:
       logger.error("Request content type is not application/json")
       return jsonify(
-        {"output": None, "metainfo": "Content-Type must be application/json"}
+        {"status": "failed", "error": "Content-Type must be application/json"}
       ), 400
 
     code = request.json.get("code")
@@ -124,14 +124,14 @@ def run_function():
 
   except common_tools.FunctionExecutionError as e:
     logger.error("Function execution failed: %s", e)
-    return jsonify({"output": None, "metainfo": str(e)}), 400
+    return jsonify({"status": "failed", "error": str(e)}), 400
   except subprocess.SubprocessError as e:
     logger.error("Unexpected error: %s", e)
     if str(e) == "Exception occurred in preexec_fn.":
       return jsonify(
-        {"output": None, "metainfo": "Execution failed: Memory limit exceeded"}
+        {"status": "failed", "error": "Execution failed: Memory limit exceeded"}
       ), 500
-    return jsonify({"output": None, "metainfo": "Internal server error"}), 500
+    return jsonify({"status": "failed", "error": "Internal server error"}), 500
 
 
 def _git(args: list[str]) -> list[str]:
@@ -255,7 +255,7 @@ def run_shell():
     if not request.is_json:
       logger.error("Request content type is not application/json")
       return jsonify(
-        {"output": None, "metainfo": "Content-Type must be application/json"}
+        {"status": "failed", "error": "Content-Type must be application/json"}
       ), 400
 
     # Get data and validate required fields
@@ -265,13 +265,13 @@ def run_shell():
     ]
     if missing_fields:
       message = f"Missing required field(s): {', '.join(missing_fields)}"
-      return jsonify({"output": None, "metainfo": message}), 400
+      return jsonify({"status": "failed", "error": message}), 400
 
     cmd = data["cmd"]
     cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
     if not cwd.is_relative_to(Path(REPO_DIR).resolve()):
       return jsonify(
-        {"output": None, "metainfo": "cwd escapes repo directory"}
+        {"status": "failed", "error": "cwd escapes repo directory"}
       ), 400
     code_files = data["code_files"]
     timeout = float(data.get("timeout", 120))
@@ -285,11 +285,11 @@ def run_shell():
 
     output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
 
-    return jsonify({"output": {"output": output, "files": files}, "metainfo": None}), 200
+    return jsonify({"status": "success", "data": {"output": output, "files": files}}), 200
 
   except Exception as e:
     logger.error("Agent execution failed: %s", e)
-    return jsonify({"output": None, "metainfo": str(e)}), 500
+    return jsonify({"status": "failed", "error": str(e)}), 500
 
 
 if __name__ == "__main__":
