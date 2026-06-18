@@ -285,7 +285,7 @@ def run_shell():
 
     output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
 
-    return jsonify({"status": "success", "data": {"output": output, "files": files}}), 200
+    return jsonify({"status": "success", "result": {"output": output, "files": files}}), 200
 
   except Exception as e:
     logger.error("Agent execution failed: %s", e)
