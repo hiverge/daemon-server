@@ -12,6 +12,7 @@ from typing import Optional
 
 import common_tools
 from flask import Flask, jsonify, request
+from pythonjsonlogger import json as json_logger
 
 REPO_DIR = os.environ.get("REPO_DIR", "/app/")  # Directory where the repository is mounted
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/shared/repo/")  # Backup directory to restore original state
@@ -21,7 +22,15 @@ app = Flask(__name__)
 sandbox_lock = threading.Lock()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+log_handler = logging.StreamHandler()
+formatter = json_logger.JsonFormatter(
+  fmt="%(asctime)s %(levelname)s %(message)s",
+  rename_fields={"levelname": "level"},
+  defaults={"category": "system"},
+)
+log_handler.setFormatter(formatter)
+logging.root.handlers = [log_handler]
+logging.root.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
