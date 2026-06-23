@@ -31,7 +31,7 @@ docker run --rm \
         echo 'Installing build dependencies...' && \
         apt-get update -qq && \
         apt-get install -y -qq binutils && \
-        pip install -q pyinstaller flask requests psutil waitress && \
+        pip install -q pyinstaller flask requests psutil waitress python-json-logger && \
         echo 'Running PyInstaller...' && \
         pyinstaller daemon-server.spec && \
         echo 'Build complete!'
