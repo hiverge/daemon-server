@@ -285,12 +285,7 @@ def run_shell():
     code_files = data["code_files"]
     timeout = float(data.get("timeout", 120))
 
-    logger.info(
-      "Executing shell command with timeout=%s, cwd=%s, cmd=%s",
-      timeout,
-      cwd,
-      cmd,
-    )
+    logger.info("Executing shell command with timeout=%s", timeout)
 
     output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
 
