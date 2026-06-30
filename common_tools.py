@@ -1,21 +1,34 @@
 """Common functionality across sandboxex."""
 
 import io
+import logging
 import signal
 import subprocess
+import threading
 import time
 
 import requests
 
-def read_stream(stream, output_list):
-  """Helper function to read stream line by line and store it in a list."""
+logger = logging.getLogger(__name__)
+
+
+def read_stream(stream, output_list, label=""):
+  """Read a stream line by line, logging each line as it arrives.
+
+  Each line is logged immediately (not buffered until the process exits) and
+  also appended to ``output_list`` so the caller can use the full output.
+  """
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
+      logger.info(
+        "[%s] %s", label, line.rstrip("\n"), extra={"category": "user"}
+      )
   except (io.UnsupportedOperation, UnicodeDecodeError) as e:
     output_list.append(f"[Error reading stream] {e}")
   finally:
     stream.close()
+
 
 class FunctionExecutionError(Exception):
   """Exception raised when a function execution fails."""
@@ -44,17 +57,43 @@ def run_command(
     universal_newlines=True,
     text=True,
   ) as process:
+    # Drain both streams in background threads so each line is logged as
+    # soon as it is emitted, rather than waiting for the process to exit.
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    readers = [
+      threading.Thread(
+        target=read_stream, args=(process.stdout, stdout_lines, "stdout")
+      ),
+      threading.Thread(
+        target=read_stream, args=(process.stderr, stderr_lines, "stderr")
+      ),
+    ]
+    for reader in readers:
+      reader.start()
+
     try:
-      stdout, stderr = process.communicate(timeout=timeout)
-      if process.returncode < 0:
-        raise FunctionExecutionError(error_code_to_string(-process.returncode))
-      if process.returncode != 0:
-        parts = [s.strip() for s in [stdout, stderr] if s.strip()]
-        raise FunctionExecutionError("Error: " + "\n".join(parts))
-      return stdout.strip().splitlines()[-1]  # Return only the last line of output
+      returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
       process.kill()
+      for reader in readers:
+        reader.join()
       raise FunctionExecutionError("Timeout") from exc
+
+    for reader in readers:
+      reader.join()
+
+    if returncode < 0:
+      raise FunctionExecutionError(error_code_to_string(-returncode))
+    if returncode != 0:
+      parts = [
+        "".join(lines).strip()
+        for lines in (stdout_lines, stderr_lines)
+        if "".join(lines).strip()
+      ]
+      raise FunctionExecutionError("Error: " + "\n".join(parts))
+    # Return only the last line of output
+    return "".join(stdout_lines).strip().splitlines()[-1]
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:

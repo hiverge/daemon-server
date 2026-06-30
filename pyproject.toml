@@ -11,3 +11,7 @@ dependencies = [
   "psutil>=5.9.0",
   "python-json-logger>=2.0.4"
 ]
+
+[tool.ruff]
+# Match the repo's existing 2-space indentation.
+indent-width = 2
