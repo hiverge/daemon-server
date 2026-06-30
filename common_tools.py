@@ -21,9 +21,7 @@ def read_stream(stream, output_list, label=""):
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
-      logger.info(
-        "[%s] %s", label, line.rstrip("\n"), extra={"category": "user"}
-      )
+      logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError) as e:
     output_list.append(f"[Error reading stream] {e}")
   finally:
@@ -57,16 +55,26 @@ def run_command(
     universal_newlines=True,
     text=True,
   ) as process:
+    # Both pipes are guaranteed open since we passed stdout/stderr=PIPE above;
+    # assert to make the non-Optional contract explicit for type checkers.
+    assert process.stdout is not None
+    assert process.stderr is not None
+
     # Drain both streams in background threads so each line is logged as
     # soon as it is emitted, rather than waiting for the process to exit.
+    # daemon=True so a stray reader can never block interpreter shutdown.
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     readers = [
       threading.Thread(
-        target=read_stream, args=(process.stdout, stdout_lines, "stdout")
+        target=read_stream,
+        args=(process.stdout, stdout_lines, "stdout"),
+        daemon=True,
       ),
       threading.Thread(
-        target=read_stream, args=(process.stderr, stderr_lines, "stderr")
+        target=read_stream,
+        args=(process.stderr, stderr_lines, "stderr"),
+        daemon=True,
       ),
     ]
     for reader in readers:
@@ -87,9 +95,9 @@ def run_command(
       raise FunctionExecutionError(error_code_to_string(-returncode))
     if returncode != 0:
       parts = [
-        "".join(lines).strip()
+        text
         for lines in (stdout_lines, stderr_lines)
-        if "".join(lines).strip()
+        if (text := "".join(lines).strip())
       ]
       raise FunctionExecutionError("Error: " + "\n".join(parts))
     # Return only the last line of output
