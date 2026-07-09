@@ -27,11 +27,13 @@ docker run --rm \
     --platform linux/amd64 \
     -v "$PWD:/src" \
     -w /src \
-    python:3.11-slim bash -c "
-        echo 'Installing build dependencies...' && \
-        apt-get update -qq && \
-        apt-get install -y -qq binutils && \
-        pip install -q pyinstaller flask requests psutil waitress python-json-logger && \
+    quay.io/pypa/manylinux2014_x86_64 bash -c "
+        echo 'Installing Python 3.8 (shared) and build deps...' && \
+        yum -y -q --disablerepo='epel*' install rh-python38-python-devel && \
+        source /opt/rh/rh-python38/enable && \
+        python3 -m ensurepip --upgrade && \
+        python3 -m pip install -q --upgrade pip && \
+        python3 -m pip install -q pyinstaller flask requests psutil waitress python-json-logger 'urllib3<2' && \
         echo 'Running PyInstaller...' && \
         pyinstaller daemon-server.spec && \
         echo 'Build complete!'
