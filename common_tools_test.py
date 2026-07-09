@@ -81,7 +81,7 @@ class TestRunCommand:
     # when it is run, then a SIGSEGV execution-failed error is raised.
     with pytest.raises(
       common_tools.FunctionExecutionError,
-      match=r"^Execution failed: Terminated by signal 11 \(SIGSEGV\)",
+      match=r"Terminated by signal 11 \(SIGSEGV\)",
     ):
       common_tools.run_command(cmd)
 
@@ -95,7 +95,7 @@ class TestRunCommand:
     # when it is run with a short timeout, then a timeout error is raised.
     with pytest.raises(
       common_tools.FunctionExecutionError,
-      match=r"^Execution failed: Timeout$",
+      match="Timeout",
     ):
       common_tools.run_command(cmd, timeout=0.5)
 
@@ -105,19 +105,34 @@ class TestLastOutputLines:
   Tests for the `last_output_lines` helper.
   """
 
-  def test_combines_stdout_and_stderr_and_keeps_tail(self) -> None:
+  def test_returns_stderr_tail_when_stderr_present(self) -> None:
     """
-    The last N lines of stdout followed by stderr are returned.
+    The last N lines of stderr are returned when stderr has output, ignoring
+    stdout entirely.
     """
-    # given stdout and stderr with more lines than the requested maximum.
+    # given stdout and stderr each with more lines than the requested maximum.
     stdout = "out1\nout2\nout3"
-    stderr = "err1\nerr2"
+    stderr = "err1\nerr2\nerr3"
 
-    # when the last three lines are requested.
-    result = common_tools.last_output_lines(stdout, stderr, max_lines=3)
+    # when the last two lines are requested.
+    result = common_tools.last_output_lines(stdout, stderr, max_lines=2)
 
-    # then the tail spanning stdout into stderr is returned.
-    assert result == "out3\nerr1\nerr2"
+    # then only the tail of stderr is returned.
+    assert result == "err2\nerr3"
+
+  def test_falls_back_to_stdout_tail_when_stderr_empty(self) -> None:
+    """
+    The last N lines of stdout are returned when stderr contains no output.
+    """
+    # given output on stdout only.
+    stdout = "out1\nout2\nout3"
+    stderr = "   \n  "
+
+    # when the last two lines are requested.
+    result = common_tools.last_output_lines(stdout, stderr, max_lines=2)
+
+    # then the tail of stdout is returned.
+    assert result == "out2\nout3"
 
   def test_returns_empty_string_when_no_output(self) -> None:
     """

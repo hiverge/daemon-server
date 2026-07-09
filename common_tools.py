@@ -31,13 +31,17 @@ def error_code_to_string(sig: int) -> str:
 # The number of trailing output lines reported when the evaluator exits with a
 # non-zero status. Showing the tail (rather than everything) keeps the error
 # message focused on where the failure surfaced while still giving context.
-MAX_ERROR_OUTPUT_LINES = 10
+MAX_ERROR_OUTPUT_LINES = 20
 
 
 def last_output_lines(
   stdout: str, stderr: str, max_lines: int = MAX_ERROR_OUTPUT_LINES
 ) -> str:
-  """Return the last few lines of the combined evaluator output.
+  """Return the last few lines of the evaluator output.
+
+  Errors usually surface on stderr, so that stream is preferred. When the
+  evaluator wrote nothing to stderr we fall back to stdout, which is where a
+  failure's context tends to appear in that case.
 
   Args:
     stdout: The evaluator's standard output.
@@ -45,11 +49,12 @@ def last_output_lines(
     max_lines: The maximum number of trailing lines to include.
 
   Returns:
-    The last `max_lines` non-empty lines of stdout followed by stderr, joined by
-    newlines. Empty when the evaluator produced no output at all.
+    The last `max_lines` non-empty lines of stderr if stderr contains any
+    output, otherwise the last `max_lines` non-empty lines of stdout. Empty when
+    the evaluator produced no output at all.
   """
-  combined = "\n".join(part.strip() for part in (stdout, stderr) if part.strip())
-  return "\n".join(combined.splitlines()[-max_lines:])
+  source = stderr if stderr.strip() else stdout
+  return "\n".join(source.strip().splitlines()[-max_lines:])
 
 
 def run_command(
@@ -73,9 +78,7 @@ def run_command(
       if process.returncode < 0:
         # The process was killed by a signal (for example, SIGSEGV). The
         # "Execution failed: " prefix marks this as an abnormal termination.
-        raise FunctionExecutionError(
-          f"Execution failed: {error_code_to_string(-process.returncode)}"
-        )
+        raise FunctionExecutionError(error_code_to_string(-process.returncode))
       if process.returncode != 0:
         # The evaluator ran to completion but exited non-zero, so the evaluation
         # did not complete cleanly. Report the exit code with the tail of its
@@ -92,7 +95,7 @@ def run_command(
       return lines[-1]  # Return only the last line of output
     except subprocess.TimeoutExpired as exc:
       process.kill()
-      raise FunctionExecutionError("Execution failed: Timeout") from exc
+      raise FunctionExecutionError("Timeout") from exc
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:
