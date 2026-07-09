@@ -28,6 +28,30 @@ def error_code_to_string(sig: int) -> str:
   return f"Terminated by signal {sig} ({sig_name}): {sig_desc}"
 
 
+# The number of trailing output lines reported when the evaluator exits with a
+# non-zero status. Showing the tail (rather than everything) keeps the error
+# message focused on where the failure surfaced while still giving context.
+MAX_ERROR_OUTPUT_LINES = 10
+
+
+def last_output_lines(
+  stdout: str, stderr: str, max_lines: int = MAX_ERROR_OUTPUT_LINES
+) -> str:
+  """Return the last few lines of the combined evaluator output.
+
+  Args:
+    stdout: The evaluator's standard output.
+    stderr: The evaluator's standard error.
+    max_lines: The maximum number of trailing lines to include.
+
+  Returns:
+    The last `max_lines` non-empty lines of stdout followed by stderr, joined by
+    newlines. Empty when the evaluator produced no output at all.
+  """
+  combined = "\n".join(part.strip() for part in (stdout, stderr) if part.strip())
+  return "\n".join(combined.splitlines()[-max_lines:])
+
+
 def run_command(
   cmd: str,
   cwd: str = ".",
@@ -47,14 +71,28 @@ def run_command(
     try:
       stdout, stderr = process.communicate(timeout=timeout)
       if process.returncode < 0:
-        raise FunctionExecutionError(error_code_to_string(-process.returncode))
+        # The process was killed by a signal (for example, SIGSEGV). The
+        # "Execution failed: " prefix marks this as an abnormal termination.
+        raise FunctionExecutionError(
+          f"Execution failed: {error_code_to_string(-process.returncode)}"
+        )
       if process.returncode != 0:
-        parts = [s.strip() for s in [stdout, stderr] if s.strip()]
-        raise FunctionExecutionError("Error: " + "\n".join(parts))
-      return stdout.strip().splitlines()[-1]  # Return only the last line of output
+        # The evaluator ran to completion but exited non-zero, so the evaluation
+        # did not complete cleanly. Report the exit code with the tail of its
+        # output so the user can see where it failed.
+        message = last_output_lines(stdout, stderr)
+        raise FunctionExecutionError(
+          f"The evaluator returned a non-zero exit code "
+          f"({process.returncode}) with the following output:\n\n{message}"
+        )
+      lines = stdout.strip().splitlines()
+      if not lines:
+        # Exited cleanly but printed nothing, so there is no result to parse.
+        raise FunctionExecutionError("The evaluator produced no output.")
+      return lines[-1]  # Return only the last line of output
     except subprocess.TimeoutExpired as exc:
       process.kill()
-      raise FunctionExecutionError("Timeout") from exc
+      raise FunctionExecutionError("Execution failed: Timeout") from exc
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:

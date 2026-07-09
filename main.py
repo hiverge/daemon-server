@@ -93,9 +93,10 @@ def execute_python_function(
       logger.info(
         "Failed to read checkpoint data: %s. Returning original error.", ee
       )
-      raise common_tools.FunctionExecutionError(
-        f"Execution failed: {e}"
-      )
+      # Re-raise the original error unchanged. `run_command` already produces
+      # the final, user-facing message (including any "Execution failed:"
+      # prefix), so it must not be wrapped again here.
+      raise e
 
 
 @app.route("/health", methods=["GET"])
