@@ -76,8 +76,7 @@ def run_command(
     try:
       stdout, stderr = process.communicate(timeout=timeout)
       if process.returncode < 0:
-        # The process was killed by a signal (for example, SIGSEGV). The
-        # "Execution failed: " prefix marks this as an abnormal termination.
+        # The process was killed by a signal (for example, SIGSEGV).
         raise FunctionExecutionError(error_code_to_string(-process.returncode))
       if process.returncode != 0:
         # The evaluator ran to completion but exited non-zero, so the evaluation
@@ -91,11 +90,11 @@ def run_command(
       lines = stdout.strip().splitlines()
       if not lines:
         # Exited cleanly but printed nothing, so there is no result to parse.
-        raise FunctionExecutionError("The evaluator produced no output.")
+        raise FunctionExecutionError("Evaluator Format Error: No output was written.")
       return lines[-1]  # Return only the last line of output
     except subprocess.TimeoutExpired as exc:
       process.kill()
-      raise FunctionExecutionError("Timeout") from exc
+      raise FunctionExecutionError(f"Evaluation timed-out after {timeout} seconds.") from exc
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:
