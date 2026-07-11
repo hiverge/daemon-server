@@ -43,31 +43,38 @@ class TestRunCommand:
     # when it is run, then a no-output error is raised.
     with pytest.raises(
       common_tools.FunctionExecutionError,
-      match=r"^The evaluator produced no output\.$",
+      match=r"^Evaluator Format Error: No output was written\.$",
     ):
       common_tools.run_command(cmd)
 
   def test_raises_exit_code_and_tail_on_nonzero_exit(self) -> None:
     """
     A command that exits non-zero reports its exit code together with the tail
-    of its output.
+    of both output streams under their own underlined headers.
     """
-    # given a command that prints two lines then exits non-zero.
+    # given a command that writes to both streams then exits non-zero.
     cmd = _python(
+      "import sys; "
       "print('some earlier noisy output'); "
-      "print('evaluator failed on its final output line'); "
-      "import sys; sys.exit(2)"
+      "print('evaluator progress on stdout'); "
+      "print('evaluator failed on stderr', file=sys.stderr); "
+      "sys.exit(2)"
     )
 
-    # when it is run, then the error carries the exit code and the output tail.
+    # when it is run, then the error carries the exit code and both stream tails.
     with pytest.raises(common_tools.FunctionExecutionError) as exc_info:
       common_tools.run_command(cmd)
 
     assert str(exc_info.value) == (
       "The evaluator returned a non-zero exit code (2) with the following "
       "output:\n\n"
+      "stderr (last 10 lines)\n"
+      "----------------------\n"
+      "evaluator failed on stderr\n\n"
+      "stdout (last 10 lines)\n"
+      "----------------------\n"
       "some earlier noisy output\n"
-      "evaluator failed on its final output line"
+      "evaluator progress on stdout"
     )
 
   def test_raises_execution_failed_on_signal(self) -> None:
@@ -95,7 +102,7 @@ class TestRunCommand:
     # when it is run with a short timeout, then a timeout error is raised.
     with pytest.raises(
       common_tools.FunctionExecutionError,
-      match="Timeout",
+      match=r"Evaluation timed-out after 0\.5 seconds\.",
     ):
       common_tools.run_command(cmd, timeout=0.5)
 
@@ -105,39 +112,65 @@ class TestLastOutputLines:
   Tests for the `last_output_lines` helper.
   """
 
-  def test_returns_stderr_tail_when_stderr_present(self) -> None:
+  def test_returns_tail_of_both_streams_with_headers(self) -> None:
     """
-    The last N lines of stderr are returned when stderr has output, ignoring
-    stdout entirely.
+    The last N lines of both stdout and stderr are returned, each under its own
+    underlined header.
     """
     # given stdout and stderr each with more lines than the requested maximum.
     stdout = "out1\nout2\nout3"
     stderr = "err1\nerr2\nerr3"
 
-    # when the last two lines are requested.
+    # when the last two lines of each stream are requested.
     result = common_tools.last_output_lines(stdout, stderr, max_lines=2)
 
-    # then only the tail of stderr is returned.
-    assert result == "err2\nerr3"
+    # then the tail of both streams is returned under underlined headers.
+    assert result == (
+      "stderr (last 2 lines)\n"
+      "---------------------\n"
+      "err2\nerr3\n\n"
+      "stdout (last 2 lines)\n"
+      "---------------------\n"
+      "out2\nout3"
+    )
 
-  def test_falls_back_to_stdout_tail_when_stderr_empty(self) -> None:
+  def test_reports_no_output_placeholder_for_empty_stream(self) -> None:
     """
-    The last N lines of stdout are returned when stderr contains no output.
+    A stream that produced no output is reported with an explicit placeholder
+    rather than being omitted.
     """
     # given output on stdout only.
     stdout = "out1\nout2\nout3"
     stderr = "   \n  "
 
-    # when the last two lines are requested.
+    # when the last two lines of each stream are requested.
     result = common_tools.last_output_lines(stdout, stderr, max_lines=2)
 
-    # then the tail of stdout is returned.
-    assert result == "out2\nout3"
+    # then stderr shows the no-output placeholder and stdout shows its tail.
+    assert result == (
+      "stderr (last 2 lines)\n"
+      "---------------------\n"
+      "<No output>\n\n"
+      "stdout (last 2 lines)\n"
+      "---------------------\n"
+      "out2\nout3"
+    )
 
-  def test_returns_empty_string_when_no_output(self) -> None:
+  def test_reports_no_output_for_both_empty_streams(self) -> None:
     """
-    Empty stdout and stderr yield an empty string.
+    Empty stdout and stderr both show the no-output placeholder under their
+    headers.
     """
     # given no output at all.
-    # when the last lines are requested, then the result is empty.
-    assert common_tools.last_output_lines("", "") == ""
+    # when the last two lines of each stream are requested.
+    result = common_tools.last_output_lines("", "", max_lines=2)
+
+    # then both streams show the no-output placeholder.
+    assert result == (
+      "stderr (last 2 lines)\n"
+      "---------------------\n"
+      "<No output>\n\n"
+      "stdout (last 2 lines)\n"
+      "---------------------\n"
+      "<No output>"
+    )

@@ -28,33 +28,58 @@ def error_code_to_string(sig: int) -> str:
   return f"Terminated by signal {sig} ({sig_name}): {sig_desc}"
 
 
-# The number of trailing output lines reported when the evaluator exits with a
-# non-zero status. Showing the tail (rather than everything) keeps the error
-# message focused on where the failure surfaced while still giving context.
-MAX_ERROR_OUTPUT_LINES = 20
+# The number of trailing output lines reported for each stream when the
+# evaluator exits with a non-zero status. Showing the tail (rather than
+# everything) keeps the error message focused on where the failure surfaced
+# while still giving context.
+MAX_ERROR_OUTPUT_LINES = 10
+
+# Placeholder shown for a stream that produced no output.
+_NO_OUTPUT_PLACEHOLDER = "<No output>"
+
+
+def _format_stream_tail(name: str, output: str, max_lines: int) -> str:
+  """Format the tail of a single output stream with an underlined header.
+
+  Args:
+    name: The stream name to show in the header (for example "stdout").
+    output: The full output captured from the stream.
+    max_lines: The maximum number of trailing lines to include.
+
+  Returns:
+    An underlined header naming the stream followed by its last `max_lines`
+    lines, or a placeholder when the stream produced no output.
+  """
+  header = f"{name} (last {max_lines} lines)"
+  underline = "-" * len(header)
+  lines = output.strip().splitlines()[-max_lines:]
+  body = "\n".join(lines) if lines else _NO_OUTPUT_PLACEHOLDER
+  return f"{header}\n{underline}\n{body}"
 
 
 def last_output_lines(
   stdout: str, stderr: str, max_lines: int = MAX_ERROR_OUTPUT_LINES
 ) -> str:
-  """Return the last few lines of the evaluator output.
+  """Return the last few lines of both evaluator output streams.
 
-  Errors usually surface on stderr, so that stream is preferred. When the
-  evaluator wrote nothing to stderr we fall back to stdout, which is where a
-  failure's context tends to appear in that case.
+  Both streams are shown because each can carry useful context: stderr usually
+  holds the failure itself, while stdout can reveal how far the evaluator got
+  before it crashed. Each stream is given an underlined header, and a stream
+  that produced no output is reported explicitly rather than omitted.
 
   Args:
     stdout: The evaluator's standard output.
     stderr: The evaluator's standard error.
-    max_lines: The maximum number of trailing lines to include.
+    max_lines: The maximum number of trailing lines to include per stream.
 
   Returns:
-    The last `max_lines` non-empty lines of stderr if stderr contains any
-    output, otherwise the last `max_lines` non-empty lines of stdout. Empty when
-    the evaluator produced no output at all.
+    The last `max_lines` lines of stderr followed by the last `max_lines` lines
+    of stdout, each under its own underlined header.
   """
-  source = stderr if stderr.strip() else stdout
-  return "\n".join(source.strip().splitlines()[-max_lines:])
+  return (
+    f"{_format_stream_tail('stderr', stderr, max_lines)}\n\n"
+    f"{_format_stream_tail('stdout', stdout, max_lines)}"
+  )
 
 
 def run_command(
