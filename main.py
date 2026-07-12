@@ -1,5 +1,6 @@
 """A simple Python sandbox server that executes Python functions."""
 
+# Needed for Python 3.8 type hint compatibility
 from __future__ import annotations
 
 import logging
