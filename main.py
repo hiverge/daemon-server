@@ -1,10 +1,12 @@
 """A simple Python sandbox server that executes Python functions."""
 
+# Needed for Python 3.8 type hint compatibility
+from __future__ import annotations
+
 import logging
 import os
 import shutil
 import subprocess
-import sys
 import threading
 from functools import wraps
 from pathlib import Path
