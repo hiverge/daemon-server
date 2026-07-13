@@ -6,14 +6,19 @@ import signal
 import subprocess
 import threading
 import time
+from collections import deque
+from collections.abc import MutableSequence, Sequence
+from typing import IO
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 
-def read_stream(stream, output_list, label=""):
-  """Read a stream line by line, logging each line as it arrives.
+def read_stream(
+  stream: IO[str], output_list: MutableSequence[str], label: str = ""
+) -> None:
+  """Read a stream line-by-line, logging each line as it arrives.
 
   Each line is logged immediately (not buffered until the process exits) and
   also appended to ``output_list`` so the caller can use the full output.
@@ -39,8 +44,62 @@ def error_code_to_string(sig: int) -> str:
   return f"Terminated by signal {sig} ({sig_name}): {sig_desc}"
 
 
+# The number of trailing output lines reported for each stream when the
+# evaluator exits with a non-zero status. Showing the tail (rather than
+# everything) keeps the error message focused on where the failure surfaced
+# while still giving context.
+MAX_ERROR_OUTPUT_LINES = 20
+
+# Placeholder shown for a stream that produced no output.
+_NO_OUTPUT_PLACEHOLDER = "<No output>"
+
+
+def _format_stream_tail(name: str, output: str, max_lines: int) -> str:
+  """Format the tail of a single output stream with an underlined header.
+
+  Args:
+    name: The stream name to show in the header (for example "stdout").
+    output: The full output captured from the stream.
+    max_lines: The maximum number of trailing lines to include.
+
+  Returns:
+    An underlined header naming the stream followed by its last `max_lines`
+    lines, or a placeholder when the stream produced no output.
+  """
+  header = f"{name} (last {max_lines} lines)"
+  underline = "-" * len(header)
+  lines = output.strip().splitlines()[-max_lines:]
+  body = "\n".join(lines) if lines else _NO_OUTPUT_PLACEHOLDER
+  return f"{header}\n{underline}\n{body}"
+
+
+def last_output_lines(
+  stdout: str, stderr: str, max_lines: int = MAX_ERROR_OUTPUT_LINES
+) -> str:
+  """Return the last few lines of both evaluator output streams.
+
+  Both streams are shown because each can carry useful context: stderr usually
+  holds the failure itself, while stdout can reveal how far the evaluator got
+  before it crashed. Each stream is given an underlined header, and a stream
+  that produced no output is reported explicitly rather than omitted.
+
+  Args:
+    stdout: The evaluator's standard output.
+    stderr: The evaluator's standard error.
+    max_lines: The maximum number of trailing lines to include per stream.
+
+  Returns:
+    The last `max_lines` lines of stderr followed by the last `max_lines` lines
+    of stdout, each under its own underlined header.
+  """
+  return (
+    f"{_format_stream_tail('stderr', stderr, max_lines)}\n\n"
+    f"{_format_stream_tail('stdout', stdout, max_lines)}"
+  )
+
+
 def run_command(
-  cmd: str,
+  cmd: str | Sequence[str],
   cwd: str = ".",
   timeout: float = 10.0,
 ) -> str:
@@ -63,8 +122,13 @@ def run_command(
     # Drain both streams in background threads so each line is logged as
     # soon as it is emitted, rather than waiting for the process to exit.
     # daemon=True so a stray reader can never block interpreter shutdown.
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
+    #
+    # Every line is still logged live by ``read_stream``, but we only retain the
+    # last ``MAX_ERROR_OUTPUT_LINES`` of each stream in memory: that is all the
+    # error tail and the success path (final stdout line) need, and it bounds
+    # memory so an evaluator cannot exhaust it by printing gigabytes of output.
+    stdout_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
+    stderr_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
     readers = [
       threading.Thread(
         target=read_stream,
@@ -86,22 +150,35 @@ def run_command(
       process.kill()
       for reader in readers:
         reader.join()
-      raise FunctionExecutionError("Timeout") from exc
+      raise FunctionExecutionError(
+        f"Evaluation timed-out after {timeout} seconds."
+      ) from exc
 
     for reader in readers:
       reader.join()
 
+    # The reader threads streamed each line to the log as it arrived; join the
+    # collected lines back into whole streams so we can report the tail of each.
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
+
     if returncode < 0:
+      # The process was killed by a signal (for example, SIGSEGV).
       raise FunctionExecutionError(error_code_to_string(-returncode))
     if returncode != 0:
-      parts = [
-        text
-        for lines in (stdout_lines, stderr_lines)
-        if (text := "".join(lines).strip())
-      ]
-      raise FunctionExecutionError("Error: " + "\n".join(parts))
-    # Return only the last line of output
-    return "".join(stdout_lines).strip().splitlines()[-1]
+      # The evaluator ran to completion but exited non-zero, so the evaluation
+      # did not complete cleanly. Report the exit code with the tail of its
+      # output so the user can see where it failed.
+      message = last_output_lines(stdout, stderr)
+      raise FunctionExecutionError(
+        f"The evaluator returned a non-zero exit code "
+        f"({returncode}) with the following output:\n\n{message}"
+      )
+    lines = stdout.strip().splitlines()
+    if not lines:
+      # Exited cleanly but printed nothing, so there is no result to parse.
+      raise FunctionExecutionError("Evaluator Format Error: No output was written.")
+    return lines[-1]  # Return only the last line of output
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:
@@ -132,7 +209,7 @@ def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:
   return False
 
 
-def stop_and_remove_image(image_name: str):
+def stop_and_remove_image(image_name: str) -> None:
   """Stop and remove a Docker image."""
 
   # Step 1: Find running container for the image

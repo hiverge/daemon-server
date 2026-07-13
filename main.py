@@ -1,10 +1,12 @@
 """A simple Python sandbox server that executes Python functions."""
 
+# Needed for Python 3.8 type hint compatibility
+from __future__ import annotations
+
 import logging
 import os
 import shutil
 import subprocess
-import sys
 import threading
 from functools import wraps
 from pathlib import Path
@@ -93,9 +95,10 @@ def execute_python_function(
       logger.info(
         "Failed to read checkpoint data: %s. Returning original error.", ee
       )
-      raise common_tools.FunctionExecutionError(
-        f"Execution failed: {e}"
-      )
+      # Re-raise the original error unchanged. `run_command` already produces
+      # the final, user-facing message (including any "Execution failed:"
+      # prefix), so it must not be wrapped again here.
+      raise e
 
 
 @app.route("/health", methods=["GET"])
@@ -285,12 +288,7 @@ def run_shell():
     code_files = data["code_files"]
     timeout = float(data.get("timeout", 120))
 
-    logger.info(
-      "Executing shell command with timeout=%s, cwd=%s, cmd=%s",
-      timeout,
-      cwd,
-      cmd,
-    )
+    logger.info("Executing shell command with timeout=%s", timeout)
 
     output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
 
