@@ -1,21 +1,37 @@
 """Common functionality across sandboxex."""
 
 import io
+import logging
 import signal
 import subprocess
+import threading
 import time
+from collections import deque
+from collections.abc import MutableSequence, Sequence
+from typing import IO
 
 import requests
 
-def read_stream(stream, output_list):
-  """Helper function to read stream line by line and store it in a list."""
+logger = logging.getLogger(__name__)
+
+
+def read_stream(
+  stream: IO[str], output_list: MutableSequence[str], label: str = ""
+) -> None:
+  """Read a stream line-by-line, logging each line as it arrives.
+
+  Each line is logged immediately (not buffered until the process exits) and
+  also appended to ``output_list`` so the caller can use the full output.
+  """
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
+      logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError) as e:
     output_list.append(f"[Error reading stream] {e}")
   finally:
     stream.close()
+
 
 class FunctionExecutionError(Exception):
   """Exception raised when a function execution fails."""
@@ -32,7 +48,7 @@ def error_code_to_string(sig: int) -> str:
 # evaluator exits with a non-zero status. Showing the tail (rather than
 # everything) keeps the error message focused on where the failure surfaced
 # while still giving context.
-MAX_ERROR_OUTPUT_LINES = 10
+MAX_ERROR_OUTPUT_LINES = 20
 
 # Placeholder shown for a stream that produced no output.
 _NO_OUTPUT_PLACEHOLDER = "<No output>"
@@ -83,7 +99,7 @@ def last_output_lines(
 
 
 def run_command(
-  cmd: str,
+  cmd: str | Sequence[str],
   cwd: str = ".",
   timeout: float = 10.0,
 ) -> str:
@@ -98,28 +114,71 @@ def run_command(
     universal_newlines=True,
     text=True,
   ) as process:
+    # Both pipes are guaranteed open since we passed stdout/stderr=PIPE above;
+    # assert to make the non-Optional contract explicit for type checkers.
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    # Drain both streams in background threads so each line is logged as
+    # soon as it is emitted, rather than waiting for the process to exit.
+    # daemon=True so a stray reader can never block interpreter shutdown.
+    #
+    # Every line is still logged live by ``read_stream``, but we only retain the
+    # last ``MAX_ERROR_OUTPUT_LINES`` of each stream in memory: that is all the
+    # error tail and the success path (final stdout line) need, and it bounds
+    # memory so an evaluator cannot exhaust it by printing gigabytes of output.
+    stdout_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
+    stderr_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
+    readers = [
+      threading.Thread(
+        target=read_stream,
+        args=(process.stdout, stdout_lines, "stdout"),
+        daemon=True,
+      ),
+      threading.Thread(
+        target=read_stream,
+        args=(process.stderr, stderr_lines, "stderr"),
+        daemon=True,
+      ),
+    ]
+    for reader in readers:
+      reader.start()
+
     try:
-      stdout, stderr = process.communicate(timeout=timeout)
-      if process.returncode < 0:
-        # The process was killed by a signal (for example, SIGSEGV).
-        raise FunctionExecutionError(error_code_to_string(-process.returncode))
-      if process.returncode != 0:
-        # The evaluator ran to completion but exited non-zero, so the evaluation
-        # did not complete cleanly. Report the exit code with the tail of its
-        # output so the user can see where it failed.
-        message = last_output_lines(stdout, stderr)
-        raise FunctionExecutionError(
-          f"The evaluator returned a non-zero exit code "
-          f"({process.returncode}) with the following output:\n\n{message}"
-        )
-      lines = stdout.strip().splitlines()
-      if not lines:
-        # Exited cleanly but printed nothing, so there is no result to parse.
-        raise FunctionExecutionError("Evaluator Format Error: No output was written.")
-      return lines[-1]  # Return only the last line of output
+      returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
       process.kill()
-      raise FunctionExecutionError(f"Evaluation timed-out after {timeout} seconds.") from exc
+      for reader in readers:
+        reader.join()
+      raise FunctionExecutionError(
+        f"Evaluation timed-out after {timeout} seconds."
+      ) from exc
+
+    for reader in readers:
+      reader.join()
+
+    # The reader threads streamed each line to the log as it arrived; join the
+    # collected lines back into whole streams so we can report the tail of each.
+    stdout = "".join(stdout_lines)
+    stderr = "".join(stderr_lines)
+
+    if returncode < 0:
+      # The process was killed by a signal (for example, SIGSEGV).
+      raise FunctionExecutionError(error_code_to_string(-returncode))
+    if returncode != 0:
+      # The evaluator ran to completion but exited non-zero, so the evaluation
+      # did not complete cleanly. Report the exit code with the tail of its
+      # output so the user can see where it failed.
+      message = last_output_lines(stdout, stderr)
+      raise FunctionExecutionError(
+        f"The evaluator returned a non-zero exit code "
+        f"({returncode}) with the following output:\n\n{message}"
+      )
+    lines = stdout.strip().splitlines()
+    if not lines:
+      # Exited cleanly but printed nothing, so there is no result to parse.
+      raise FunctionExecutionError("Evaluator Format Error: No output was written.")
+    return lines[-1]  # Return only the last line of output
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:
@@ -150,7 +209,7 @@ def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:
   return False
 
 
-def stop_and_remove_image(image_name: str):
+def stop_and_remove_image(image_name: str) -> None:
   """Stop and remove a Docker image."""
 
   # Step 1: Find running container for the image

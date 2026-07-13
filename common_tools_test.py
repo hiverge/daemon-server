@@ -1,5 +1,7 @@
 """Tests for the common_tools module."""
 
+import io
+import signal
 import sys
 
 import pytest
@@ -68,13 +70,71 @@ class TestRunCommand:
     assert str(exc_info.value) == (
       "The evaluator returned a non-zero exit code (2) with the following "
       "output:\n\n"
-      "stderr (last 10 lines)\n"
+      "stderr (last 20 lines)\n"
       "----------------------\n"
       "evaluator failed on stderr\n\n"
-      "stdout (last 10 lines)\n"
+      "stdout (last 20 lines)\n"
       "----------------------\n"
       "some earlier noisy output\n"
       "evaluator progress on stdout"
+    )
+
+  def test_reports_stderr_tail_when_stdout_empty_on_nonzero_exit(self) -> None:
+    """
+    A command that writes only to stderr before failing reports the stderr tail
+    and a no-output placeholder for stdout.
+    """
+    # given a command that writes only to stderr then exits non-zero.
+    cmd = _python(
+      "import sys; "
+      "print('boom on stderr', file=sys.stderr); "
+      "sys.exit(1)"
+    )
+
+    # when it is run, then stderr carries the tail and stdout shows no output.
+    with pytest.raises(common_tools.FunctionExecutionError) as exc_info:
+      common_tools.run_command(cmd)
+
+    assert str(exc_info.value) == (
+      "The evaluator returned a non-zero exit code (1) with the following "
+      "output:\n\n"
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      "boom on stderr\n\n"
+      "stdout (last 20 lines)\n"
+      "----------------------\n"
+      "<No output>"
+    )
+
+  def test_retains_only_the_tail_of_large_output_on_nonzero_exit(self) -> None:
+    """
+    A command that prints far more than the retained tail reports only the last
+    `MAX_ERROR_OUTPUT_LINES` lines of each stream, bounding memory use.
+    """
+    # given a command that prints 1000 lines to each stream then exits non-zero.
+    cmd = _python(
+      "import sys\n"
+      "for i in range(1000):\n"
+      "    print(f'out{i}')\n"
+      "    print(f'err{i}', file=sys.stderr)\n"
+      "sys.exit(1)"
+    )
+
+    # when it is run, then only the final 20 lines of each stream are reported.
+    with pytest.raises(common_tools.FunctionExecutionError) as exc_info:
+      common_tools.run_command(cmd)
+
+    expected_stderr_tail = "\n".join(f"err{i}" for i in range(980, 1000))
+    expected_stdout_tail = "\n".join(f"out{i}" for i in range(980, 1000))
+    assert str(exc_info.value) == (
+      "The evaluator returned a non-zero exit code (1) with the following "
+      "output:\n\n"
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      f"{expected_stderr_tail}\n\n"
+      "stdout (last 20 lines)\n"
+      "----------------------\n"
+      f"{expected_stdout_tail}"
     )
 
   def test_raises_execution_failed_on_signal(self) -> None:
@@ -173,4 +233,44 @@ class TestLastOutputLines:
       "stdout (last 2 lines)\n"
       "---------------------\n"
       "<No output>"
+    )
+
+  def test_returns_all_lines_when_fewer_than_max(self) -> None:
+    """
+    When a stream has fewer lines than the maximum, every line is returned
+    unchanged.
+    """
+    # given streams with fewer lines than the requested maximum.
+    stdout = "only out line"
+    stderr = "only err line"
+
+    # when up to ten lines of each stream are requested.
+    result = common_tools.last_output_lines(stdout, stderr, max_lines=10)
+
+    # then all available lines are returned under their headers.
+    assert result == (
+      "stderr (last 10 lines)\n"
+      "----------------------\n"
+      "only err line\n\n"
+      "stdout (last 10 lines)\n"
+      "----------------------\n"
+      "only out line"
+    )
+
+  def test_uses_default_max_lines_in_header(self) -> None:
+    """
+    When `max_lines` is omitted the default is used in the header text.
+    """
+    # given output on both streams and no explicit maximum.
+    # when the last lines are requested using the default maximum.
+    result = common_tools.last_output_lines("out", "err")
+
+    # then the header reflects the module default of twenty lines.
+    assert result == (
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      "err\n\n"
+      "stdout (last 20 lines)\n"
+      "----------------------\n"
+      "out"
     )
