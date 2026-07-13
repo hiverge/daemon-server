@@ -1,0 +1,30 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Match the exact interpreter the release binary is built against.
+          python-version: "3.12.8"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # common_tools imports requests; the suite runs under pytest.
+          python -m pip install pytest requests
+
+      - name: Run tests
+        run: python -m pytest common_tools_test.py -v

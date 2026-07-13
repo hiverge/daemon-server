@@ -1,7 +1,5 @@
 """Tests for the common_tools module."""
 
-import io
-import signal
 import sys
 
 import pytest

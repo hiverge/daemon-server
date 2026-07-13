@@ -23,21 +23,45 @@ rm -rf build/ dist/
 
 # Build binary using PyInstaller in Docker
 echo "Building binary (this may take 2-3 minutes)..."
-docker run --rm \
+docker run --rm -i \
     --platform linux/amd64 \
     -v "$PWD:/src" \
     -w /src \
-    quay.io/pypa/manylinux2014_x86_64 bash -c "
-        echo 'Installing Python 3.8 (shared) and build deps...' && \
-        yum -y -q --disablerepo='epel*' install rh-python38-python-devel && \
-        source /opt/rh/rh-python38/enable && \
-        python3 -m ensurepip --upgrade && \
-        python3 -m pip install -q --upgrade pip && \
-        python3 -m pip install -q pyinstaller flask requests psutil waitress python-json-logger 'urllib3<2' && \
-        echo 'Running PyInstaller...' && \
-        pyinstaller daemon-server.spec && \
-        echo 'Build complete!'
-    "
+    quay.io/pypa/manylinux2014_x86_64 bash -s <<'DOCKER_BUILD'
+set -e
+PYTHON_VERSION=3.12.8
+
+echo "Installing build deps and compiling Python ${PYTHON_VERSION} (shared) from source..."
+yum -y -q install openssl11-devel libffi-devel bzip2-devel
+
+# openssl11 uses a non-standard layout; assemble a standard prefix for --with-openssl
+mkdir -p /tmp/ssl/include /tmp/ssl/lib
+ln -sf /usr/include/openssl11/openssl /tmp/ssl/include/openssl
+ln -sf /usr/lib64/openssl11/libssl.so /tmp/ssl/lib/libssl.so
+ln -sf /usr/lib64/openssl11/libcrypto.so /tmp/ssl/lib/libcrypto.so
+
+cd /tmp
+curl -sSL "https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz" -o python-src.tgz
+tar xzf python-src.tgz
+cd "Python-${PYTHON_VERSION}"
+
+# --enable-shared produces libpython3.12.so, which PyInstaller requires
+./configure --enable-shared --with-openssl=/tmp/ssl --with-openssl-rpath=auto >/tmp/configure.log 2>&1
+make -j"$(nproc)" >/tmp/make.log 2>&1
+make altinstall >/tmp/install.log 2>&1
+ldconfig
+cd /src
+
+PY=/usr/local/bin/python3.12
+"$PY" --version
+"$PY" -c 'import ssl; print("ssl:", ssl.OPENSSL_VERSION)'
+"$PY" -m ensurepip --upgrade
+"$PY" -m pip install -q --upgrade pip
+"$PY" -m pip install -q pyinstaller flask requests psutil waitress python-json-logger 'urllib3<2'
+echo 'Running PyInstaller...'
+"$PY" -m PyInstaller daemon-server.spec
+echo 'Build complete!'
+DOCKER_BUILD
 
 # Check if build succeeded and rename with architecture
 if [ -f dist/daemon-server ]; then
