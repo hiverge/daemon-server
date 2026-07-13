@@ -11,59 +11,17 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-# Caps on how much a single command may write to the logs, so a user cannot
-# spam gigabytes of output. Beyond these, lines are dropped/truncated (the
-# full output is still captured in output_list for the return value).
-MAX_LOG_LINES = 100_000  # total logged lines per command (across all streams)
-MAX_LOG_LINE_BYTES = 1024  # per-line byte cap before truncation
 
-
-class LogLimiter:
-  """Thread-safe logging budget shared by a command's stream readers."""
-
-  def __init__(self, max_lines=MAX_LOG_LINES, max_line_bytes=MAX_LOG_LINE_BYTES):
-    self._max_lines = max_lines
-    self._max_line_bytes = max_line_bytes
-    self._count = 0
-    self._lock = threading.Lock()
-
-  def log(self, label, line):
-    """Log a single line, honoring the line-count and per-line size caps."""
-    with self._lock:
-      if self._count >= self._max_lines:
-        # Emit a one-time notice the moment we hit the cap, then stay silent.
-        if self._count == self._max_lines:
-          self._count += 1
-          logger.info(
-            "[%s] output truncated after %s lines",
-            label,
-            self._max_lines,
-            extra={"category": "user"},
-          )
-        return
-      self._count += 1
-
-    text = line.rstrip("\r\n")
-    encoded = text.encode("utf-8")
-    if len(encoded) > self._max_line_bytes:
-      text = (
-        encoded[: self._max_line_bytes].decode("utf-8", errors="ignore")
-        + " ... [line truncated]"
-      )
-    logger.info("[%s] %s", label, text, extra={"category": "user"})
-
-
-def read_stream(stream, output_list, limiter, label=""):
+def read_stream(stream, output_list, label=""):
   """Read a stream line by line, logging each line as it arrives.
 
-  Each line is logged immediately (not buffered until the process exits),
-  subject to ``limiter``'s caps, and also appended to ``output_list`` so the
-  caller can use the full output.
+  Each line is logged immediately (not buffered until the process exits) and
+  also appended to ``output_list`` so the caller can use the full output.
   """
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
-      limiter.log(label, line)
+      logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError) as e:
     output_list.append(f"[Error reading stream] {e}")
   finally:
@@ -107,16 +65,15 @@ def run_command(
     # daemon=True so a stray reader can never block interpreter shutdown.
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
-    limiter = LogLimiter()
     readers = [
       threading.Thread(
         target=read_stream,
-        args=(process.stdout, stdout_lines, limiter, "stdout"),
+        args=(process.stdout, stdout_lines, "stdout"),
         daemon=True,
       ),
       threading.Thread(
         target=read_stream,
-        args=(process.stderr, stderr_lines, limiter, "stderr"),
+        args=(process.stderr, stderr_lines, "stderr"),
         daemon=True,
       ),
     ]
