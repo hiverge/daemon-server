@@ -2,6 +2,7 @@
 
 import io
 import logging
+import os
 import signal
 import subprocess
 import threading
@@ -105,6 +106,17 @@ def run_command(
 ) -> str:
   """Run a command with timeout and return the output."""
 
+  # PyInstaller can poison the subprocess environemnt. See below
+  # https://pyinstaller.org/en/stable/runtime-information.html?ld-library-path-libpath-considerations=#ld-library-path-libpath-considerations
+  env = os.environ.copy()
+  orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+  if orig:
+    env["LD_LIBRARY_PATH"] = orig
+  else:
+    env.pop("LD_LIBRARY_PATH", None)
+  # Also configure Python to use unbuffered output so we can stream the output 
+  env["PYTHONUNBUFFERED"] = "1"
+
   with subprocess.Popen(
     cmd,
     stdout=subprocess.PIPE,
@@ -113,6 +125,7 @@ def run_command(
     bufsize=1,  # Allows real-time output
     universal_newlines=True,
     text=True,
+    env=env,
   ) as process:
     # Both pipes are guaranteed open since we passed stdout/stderr=PIPE above;
     # assert to make the non-Optional contract explicit for type checkers.
