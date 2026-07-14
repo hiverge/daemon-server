@@ -80,7 +80,7 @@ def execute_python_function(
   python_executable = os.environ.get("PYTHON_EXECUTABLE", "python3")
   try:
     output = common_tools.run_command(
-      [python_executable, "-u", evaluation_script] + args, REPO_DIR, timeout
+      [python_executable, evaluation_script] + args, REPO_DIR, timeout
     )
     return output
   except common_tools.FunctionExecutionError as e:
