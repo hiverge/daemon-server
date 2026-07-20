@@ -68,13 +68,13 @@ class TestRunCommand:
     assert str(exc_info.value) == (
       "The evaluator returned a non-zero exit code (2) with the following "
       "output:\n\n"
-      "stderr (last 20 lines)\n"
-      "----------------------\n"
-      "evaluator failed on stderr\n\n"
       "stdout (last 20 lines)\n"
       "----------------------\n"
       "some earlier noisy output\n"
-      "evaluator progress on stdout"
+      "evaluator progress on stdout\n\n"
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      "evaluator failed on stderr"
     )
 
   def test_reports_stderr_tail_when_stdout_empty_on_nonzero_exit(self) -> None:
@@ -96,12 +96,12 @@ class TestRunCommand:
     assert str(exc_info.value) == (
       "The evaluator returned a non-zero exit code (1) with the following "
       "output:\n\n"
-      "stderr (last 20 lines)\n"
-      "----------------------\n"
-      "boom on stderr\n\n"
       "stdout (last 20 lines)\n"
       "----------------------\n"
-      "<No output>"
+      "<No output>\n\n"
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      "boom on stderr"
     )
 
   def test_retains_only_the_tail_of_large_output_on_nonzero_exit(self) -> None:
@@ -127,12 +127,12 @@ class TestRunCommand:
     assert str(exc_info.value) == (
       "The evaluator returned a non-zero exit code (1) with the following "
       "output:\n\n"
-      "stderr (last 20 lines)\n"
-      "----------------------\n"
-      f"{expected_stderr_tail}\n\n"
       "stdout (last 20 lines)\n"
       "----------------------\n"
-      f"{expected_stdout_tail}"
+      f"{expected_stdout_tail}\n\n"
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      f"{expected_stderr_tail}"
     )
 
   def test_raises_execution_failed_on_signal(self) -> None:
@@ -184,12 +184,12 @@ class TestLastOutputLines:
 
     # then the tail of both streams is returned under underlined headers.
     assert result == (
-      "stderr (last 2 lines)\n"
-      "---------------------\n"
-      "err2\nerr3\n\n"
       "stdout (last 2 lines)\n"
       "---------------------\n"
-      "out2\nout3"
+      "out2\nout3\n\n"
+      "stderr (last 2 lines)\n"
+      "---------------------\n"
+      "err2\nerr3"
     )
 
   def test_reports_no_output_placeholder_for_empty_stream(self) -> None:
@@ -206,12 +206,12 @@ class TestLastOutputLines:
 
     # then stderr shows the no-output placeholder and stdout shows its tail.
     assert result == (
-      "stderr (last 2 lines)\n"
-      "---------------------\n"
-      "<No output>\n\n"
       "stdout (last 2 lines)\n"
       "---------------------\n"
-      "out2\nout3"
+      "out2\nout3\n\n"
+      "stderr (last 2 lines)\n"
+      "---------------------\n"
+      "<No output>"
     )
 
   def test_reports_no_output_for_both_empty_streams(self) -> None:
@@ -225,10 +225,10 @@ class TestLastOutputLines:
 
     # then both streams show the no-output placeholder.
     assert result == (
-      "stderr (last 2 lines)\n"
+      "stdout (last 2 lines)\n"
       "---------------------\n"
       "<No output>\n\n"
-      "stdout (last 2 lines)\n"
+      "stderr (last 2 lines)\n"
       "---------------------\n"
       "<No output>"
     )
@@ -247,12 +247,12 @@ class TestLastOutputLines:
 
     # then all available lines are returned under their headers.
     assert result == (
-      "stderr (last 10 lines)\n"
-      "----------------------\n"
-      "only err line\n\n"
       "stdout (last 10 lines)\n"
       "----------------------\n"
-      "only out line"
+      "only out line\n\n"
+      "stderr (last 10 lines)\n"
+      "----------------------\n"
+      "only err line"
     )
 
   def test_uses_default_max_lines_in_header(self) -> None:
@@ -265,10 +265,10 @@ class TestLastOutputLines:
 
     # then the header reflects the module default of twenty lines.
     assert result == (
-      "stderr (last 20 lines)\n"
-      "----------------------\n"
-      "err\n\n"
       "stdout (last 20 lines)\n"
       "----------------------\n"
-      "out"
+      "out\n\n"
+      "stderr (last 20 lines)\n"
+      "----------------------\n"
+      "err"
     )

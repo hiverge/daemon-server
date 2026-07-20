@@ -90,12 +90,12 @@ def last_output_lines(
     max_lines: The maximum number of trailing lines to include per stream.
 
   Returns:
-    The last `max_lines` lines of stderr followed by the last `max_lines` lines
-    of stdout, each under its own underlined header.
+    The last `max_lines` lines of stdout followed by the last `max_lines` lines
+    of stderr, each under its own underlined header.
   """
   return (
-    f"{_format_stream_tail('stderr', stderr, max_lines)}\n\n"
-    f"{_format_stream_tail('stdout', stdout, max_lines)}"
+    f"{_format_stream_tail('stdout', stdout, max_lines)}\n\n"
+    f"{_format_stream_tail('stderr', stderr, max_lines)}"
   )
 
 
