@@ -27,9 +27,7 @@ def read_stream(
       output_list.append(line)
       logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError, ValueError) as e:
-    # ValueError: the stream was closed underneath us. A reader abandoned after
-    # `READER_JOIN_TIMEOUT` is still blocked in `readline` when `Popen.__exit__`
-    # closes the pipe.
+    # ValueError: the stream was closed underneath us.
     output_list.append(f"[Error reading stream] {e}")
   finally:
     stream.close()
@@ -134,6 +132,8 @@ def kill_process_group(process: subprocess.Popen) -> None:
   exited: the group outlives its leader while any member runs, so this also reaps
   orphans left by a clean exit.
 
+  Signals only. `release_process` does the bounded wait for the leader to die.
+
   Best effort — a descendant that calls `setsid()` or double-forks leaves the
   group and survives.
   """
@@ -143,16 +143,7 @@ def kill_process_group(process: subprocess.Popen) -> None:
     os.killpg(process.pid, signal.SIGKILL)
   except ProcessLookupError:
     # The group is already gone.
-    return
-
-  try:
-    process.wait(timeout=PROCESS_GROUP_KILL_TIMEOUT)
-  except subprocess.TimeoutExpired:
-    logger.warning(
-      "Process %d survived SIGKILL for %.0fs.",
-      process.pid,
-      PROCESS_GROUP_KILL_TIMEOUT,
-    )
+    pass
 
 
 def start_stream_readers(
