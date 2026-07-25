@@ -234,27 +234,52 @@ def execute_shell_command(
 
   init_git_tracking()
 
-  # Run the shell command
-  try:
-    result = subprocess.run(
-      cmd,
-      shell=True,
-      cwd=cwd,
-      capture_output=True,
-      encoding="utf-8",
-      errors="replace",
-      timeout=timeout,
-    )
-    parts = []
-    if result.stdout:
-      parts.append(result.stdout)
-    if result.stderr:
-      parts.append(f"STDERR:\n{result.stderr}")
-    if result.returncode != 0:
-      parts.append(f"Exit code: {result.returncode}")
-    output = "\n".join(parts) if parts else "(no output)"
-  except subprocess.TimeoutExpired:
+  # Run the shell command in its own process group, and time out on its own exit
+  # rather than on its output reaching end-of-stream. A backgrounded job (`cmd &`)
+  # inherits the pipes, so timing out on end-of-stream would charge the command
+  # the full lifetime of everything it spawned.
+  stdout_lines: list[str] = []
+  stderr_lines: list[str] = []
+  with subprocess.Popen(
+    cmd,
+    shell=True,
+    cwd=cwd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    encoding="utf-8",
+    errors="replace",
+    start_new_session=True,
+  ) as process:
+    readers = common_tools.start_stream_readers(process, stdout_lines, stderr_lines)
+    try:
+      returncode = process.wait(timeout=timeout)
+      timed_out = False
+    except subprocess.TimeoutExpired:
+      returncode = None
+      timed_out = True
+
+    # Stop the command and everything it started, then collect whatever output
+    # made it through. Undrained output is reported as truncated below: a shell
+    # command has no single result line that a leaked process could invalidate.
+    common_tools.kill_process_group(process)
+    drained = common_tools.join_stream_readers(readers)
+
+  if timed_out:
     output = f"Error: command timed out after {timeout}s"
+  else:
+    parts = []
+    if stdout_lines:
+      parts.append("".join(stdout_lines))
+    if stderr_lines:
+      parts.append(f"STDERR:\n{''.join(stderr_lines)}")
+    if returncode != 0:
+      parts.append(f"Exit code: {returncode}")
+    if not drained:
+      parts.append(
+        "[Output truncated: the command left background processes holding its "
+        "output.]"
+      )
+    output = "\n".join(parts) if parts else "(no output)"
 
   return output, get_changed_files()
 
