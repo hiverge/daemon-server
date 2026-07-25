@@ -19,16 +19,17 @@ logger = logging.getLogger(__name__)
 def read_stream(
   stream: IO[str], output_list: MutableSequence[str], label: str = ""
 ) -> None:
-  """Read a stream line-by-line, logging each line as it arrives.
-
-  Each line is logged immediately (not buffered until the process exits) and
-  also appended to ``output_list`` so the caller can use the full output.
+  """Read a stream line-by-line, logging each line and appending it to
+  ``output_list``.
   """
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
       logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
-  except (io.UnsupportedOperation, UnicodeDecodeError) as e:
+  except (io.UnsupportedOperation, UnicodeDecodeError, ValueError) as e:
+    # ValueError: the stream was closed underneath us. A reader abandoned after
+    # `READER_JOIN_TIMEOUT` is still blocked in `readline` when `Popen.__exit__`
+    # closes the pipe.
     output_list.append(f"[Error reading stream] {e}")
   finally:
     stream.close()
@@ -46,13 +47,26 @@ def error_code_to_string(sig: int) -> str:
 
 
 # The number of trailing output lines reported for each stream when the
-# evaluator exits with a non-zero status. Showing the tail (rather than
-# everything) keeps the error message focused on where the failure surfaced
-# while still giving context.
+# evaluator exits with a non-zero status.
 MAX_ERROR_OUTPUT_LINES = 20
 
 # Placeholder shown for a stream that produced no output.
 _NO_OUTPUT_PLACEHOLDER = "<No output>"
+
+# How long to wait for a reader thread to see end-of-stream. A stream ends only
+# once every process holding a copy of the pipe has exited, so a descendant that
+# outlives the command (a worker pool, a spawned server, a backgrounded shell
+# job) holds it open indefinitely.
+#
+# Once the command itself is gone, at most one pipe buffer (64 KiB, ~800 lines)
+# remains to drain, well under a millisecond. The rest of this budget covers a
+# straggling descendant still shutting down.
+READER_JOIN_TIMEOUT = 5.0
+
+# How long to give a killed process group to die. `SIGKILL` cannot be caught, so
+# this covers only the kernel's own cleanup; a process wedged in an
+# uninterruptible syscall can outlast it.
+PROCESS_GROUP_KILL_TIMEOUT = 5.0
 
 
 def _format_stream_tail(name: str, output: str, max_lines: int) -> str:
@@ -79,10 +93,8 @@ def last_output_lines(
 ) -> str:
   """Return the last few lines of both evaluator output streams.
 
-  Both streams are shown because each can carry useful context: stderr usually
-  holds the failure itself, while stdout can reveal how far the evaluator got
-  before it crashed. Each stream is given an underlined header, and a stream
-  that produced no output is reported explicitly rather than omitted.
+  Each stream is given an underlined header, and a stream that produced no output
+  is reported with a placeholder.
 
   Args:
     stdout: The evaluator's standard output.
@@ -99,12 +111,104 @@ def last_output_lines(
   )
 
 
+def kill_process_group(process: subprocess.Popen) -> None:
+  """Kill `process` and every descendant it started.
+
+  Requires `process` to have been started with `start_new_session=True`, which
+  makes it the leader of its own process group. Safe to call after `process` has
+  exited: the group outlives its leader while any member runs, so this also reaps
+  orphans left by a clean exit.
+
+  Best effort — a descendant that calls `setsid()` or double-forks leaves the
+  group and survives.
+  """
+  # The group id is the leader's pid. `os.getpgid()` would fail once the leader
+  # has been reaped, while the rest of the group is still running.
+  try:
+    os.killpg(process.pid, signal.SIGKILL)
+  except ProcessLookupError:
+    # The group is already gone.
+    return
+
+  try:
+    process.wait(timeout=PROCESS_GROUP_KILL_TIMEOUT)
+  except subprocess.TimeoutExpired:
+    logger.warning(
+      "Process %d survived SIGKILL for %.0fs.",
+      process.pid,
+      PROCESS_GROUP_KILL_TIMEOUT,
+    )
+
+
+def start_stream_readers(
+  process: subprocess.Popen,
+  stdout_sink: MutableSequence[str],
+  stderr_sink: MutableSequence[str],
+) -> list[threading.Thread]:
+  """Start background threads draining `process`'s stdout and stderr.
+
+  Each line is logged as it arrives and appended to the matching sink. The threads
+  are daemons, so a reader left blocked on a pipe cannot prevent interpreter
+  shutdown.
+  """
+  # The caller passed stdout/stderr=PIPE, so both are open.
+  assert process.stdout is not None
+  assert process.stderr is not None
+
+  # Each thread is named after its stream, which `join_stream_readers` reports.
+  readers = [
+    threading.Thread(
+      target=read_stream,
+      args=(process.stdout, stdout_sink, "stdout"),
+      name="stdout",
+      daemon=True,
+    ),
+    threading.Thread(
+      target=read_stream,
+      args=(process.stderr, stderr_sink, "stderr"),
+      name="stderr",
+      daemon=True,
+    ),
+  ]
+  for reader in readers:
+    reader.start()
+  return readers
+
+
+def join_stream_readers(readers: Sequence[threading.Thread]) -> bool:
+  """Wait for the reader threads to finish, up to `READER_JOIN_TIMEOUT` total.
+
+  Returns True if every reader reached end-of-stream, and False if any is still
+  blocked on a pipe that something else is holding open.
+  """
+  deadline = time.monotonic() + READER_JOIN_TIMEOUT
+  for reader in readers:
+    reader.join(timeout=max(0.0, deadline - time.monotonic()))
+
+  stuck = [reader.name for reader in readers if reader.is_alive()]
+  if stuck:
+    logger.warning(
+      "Output not drained after %.0fs: %s still blocked, so a process is holding "
+      "the pipe. Abandoning the reader(s) to release the sandbox.",
+      READER_JOIN_TIMEOUT,
+      ", ".join(stuck),
+    )
+    return False
+
+  return True
+
+
 def run_command(
   cmd: str | Sequence[str],
   cwd: str = ".",
   timeout: float = 10.0,
 ) -> str:
-  """Run a command with timeout and return the output."""
+  """Run a command with timeout and return the last line of its output.
+
+  The command runs in its own process group, and both the wait for it to exit and
+  the wait for its output to drain are bounded, so this returns even when the
+  command leaves background processes behind.
+  """
 
   # PyInstaller can poison the subprocess environemnt. See below
   # https://pyinstaller.org/en/stable/runtime-information.html?ld-library-path-libpath-considerations=#ld-library-path-libpath-considerations
@@ -126,52 +230,43 @@ def run_command(
     universal_newlines=True,
     text=True,
     env=env,
+    # Own process group, so everything the command spawns can be cleaned up
+    # together. See `kill_process_group`.
+    start_new_session=True,
   ) as process:
-    # Both pipes are guaranteed open since we passed stdout/stderr=PIPE above;
-    # assert to make the non-Optional contract explicit for type checkers.
-    assert process.stdout is not None
-    assert process.stderr is not None
-
-    # Drain both streams in background threads so each line is logged as
-    # soon as it is emitted, rather than waiting for the process to exit.
-    # daemon=True so a stray reader can never block interpreter shutdown.
-    #
-    # Every line is still logged live by ``read_stream``, but we only retain the
-    # last ``MAX_ERROR_OUTPUT_LINES`` of each stream in memory: that is all the
-    # error tail and the success path (final stdout line) need, and it bounds
-    # memory so an evaluator cannot exhaust it by printing gigabytes of output.
+    # `read_stream` logs every line live, so only the last
+    # `MAX_ERROR_OUTPUT_LINES` of each stream are retained here: enough for the
+    # error tail and the final stdout line, and bounded no matter how much the
+    # evaluator prints.
     stdout_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
     stderr_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
-    readers = [
-      threading.Thread(
-        target=read_stream,
-        args=(process.stdout, stdout_lines, "stdout"),
-        daemon=True,
-      ),
-      threading.Thread(
-        target=read_stream,
-        args=(process.stderr, stderr_lines, "stderr"),
-        daemon=True,
-      ),
-    ]
-    for reader in readers:
-      reader.start()
+    readers = start_stream_readers(process, stdout_lines, stderr_lines)
 
     try:
       returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-      process.kill()
-      for reader in readers:
-        reader.join()
+      kill_process_group(process)
+      join_stream_readers(readers)
       raise FunctionExecutionError(
         f"Evaluation timed-out after {timeout} seconds."
       ) from exc
 
-    for reader in readers:
-      reader.join()
+    # Drain before killing the group: killing closes the pipes, and a pipe still
+    # open is the evidence that a descendant outlived the evaluator.
+    drained = join_stream_readers(readers)
+    if not drained:
+      kill_process_group(process)
+      raise FunctionExecutionError(
+        "The evaluator exited but left background processes still holding its "
+        "output, so its result could not be collected. Ensure the evaluator "
+        "terminates every process it starts before exiting."
+      )
 
-    # The reader threads streamed each line to the log as it arrived; join the
-    # collected lines back into whole streams so we can report the tail of each.
+    # The output drained, so the result below is trustworthy. Descendants that
+    # closed or never inherited the pipes can still be running, and would compete
+    # with the next evaluation for this pod's CPU and memory.
+    kill_process_group(process)
+
     stdout = "".join(stdout_lines)
     stderr = "".join(stderr_lines)
 
@@ -179,9 +274,8 @@ def run_command(
       # The process was killed by a signal (for example, SIGSEGV).
       raise FunctionExecutionError(error_code_to_string(-returncode))
     if returncode != 0:
-      # The evaluator ran to completion but exited non-zero, so the evaluation
-      # did not complete cleanly. Report the exit code with the tail of its
-      # output so the user can see where it failed.
+      # Ran to completion but exited non-zero. Report the exit code with the tail
+      # of its output.
       message = last_output_lines(stdout, stderr)
       raise FunctionExecutionError(
         f"The evaluator returned a non-zero exit code "

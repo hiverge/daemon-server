@@ -1,6 +1,12 @@
 """Tests for the common_tools module."""
 
+import contextlib
+import logging
+import os
+import pathlib
+import signal
 import sys
+import time
 
 import pytest
 
@@ -12,6 +18,23 @@ def _python(code: str) -> list[str]:
   Build a command that runs the given Python source in a subprocess.
   """
   return [sys.executable, "-c", code]
+
+
+def _wait_until_dead(pid: int, timeout: float = 5.0) -> bool:
+  """
+  Poll until `pid` disappears, returning whether it did within `timeout`.
+
+  `SIGKILL` delivery to a whole process group is not instantaneous.
+  """
+  deadline = time.monotonic() + timeout
+  while True:
+    try:
+      os.kill(pid, 0)
+    except ProcessLookupError:
+      return True
+    if time.monotonic() >= deadline:
+      return False
+    time.sleep(0.05)
 
 
 class TestRunCommand:
@@ -163,6 +186,140 @@ class TestRunCommand:
       match=r"Evaluation timed-out after 0\.5 seconds\.",
     ):
       common_tools.run_command(cmd, timeout=0.5)
+
+
+class TestOrphanedDescendants:
+  """
+  Tests that a command leaving background processes behind can neither wedge the
+  request nor keep running on the pod.
+
+  A descendant inherits the command's stdout/stderr, so the pipes end only once
+  every one of them has exited.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _short_join_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shorten the reader deadline so these tests stay fast."""
+    monkeypatch.setattr(common_tools, "READER_JOIN_TIMEOUT", 1.0)
+
+  def test_returns_promptly_when_orphan_holds_output(self) -> None:
+    """
+    An evaluator that exits cleanly but leaves a child holding its output fails
+    fast, rather than blocking until the child exits.
+    """
+    # given an evaluator that spawns a long-lived child sharing its stdout/stderr
+    # and then exits cleanly itself.
+    cmd = _python(
+      "import subprocess, sys; "
+      "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+      "print('fitness: 1.0')"
+    )
+
+    # when it is run, then it fails naming the leaked processes as the cause.
+    start = time.monotonic()
+    with pytest.raises(
+      common_tools.FunctionExecutionError,
+      match=r"left background processes still holding its output",
+    ):
+      common_tools.run_command(cmd, timeout=30)
+
+    # and it returns on the reader deadline, not the child's 60s lifetime.
+    assert time.monotonic() - start < 20
+
+  def test_kills_orphan_that_outlives_a_timed_out_evaluator(
+    self, tmp_path: pathlib.Path
+  ) -> None:
+    """
+    Timing out kills the whole process group, not just the evaluator, so no
+    descendant is left consuming the pod's resources.
+    """
+    # given an evaluator that spawns a long-lived child and then hangs itself. The
+    # child's pid goes to a file, as a timed-out run reports only the timeout.
+    pid_file = tmp_path / "child.pid"
+    cmd = _python(
+      "import subprocess, sys, time; "
+      "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+      f"open({str(pid_file)!r}, 'w').write(str(child.pid)); "
+      "time.sleep(60)"
+    )
+
+    # when it is run with a short timeout, then it times out.
+    with pytest.raises(
+      common_tools.FunctionExecutionError,
+      match=r"Evaluation timed-out",
+    ):
+      common_tools.run_command(cmd, timeout=1)
+
+    # and the orphaned child was killed along with it.
+    child_pid = int(pid_file.read_text())
+    assert _wait_until_dead(child_pid), (
+      f"orphan {child_pid} survived the timeout and is still running on the pod"
+    )
+
+  def test_warns_when_output_cannot_be_drained(
+    self, caplog: pytest.LogCaptureFixture, tmp_path: pathlib.Path
+  ) -> None:
+    """
+    Abandoning a reader is reported at WARNING, naming the stuck stream.
+
+    A timed-out command reports only the timeout to the caller, so the log is the
+    only place its leaked descendant surfaces.
+    """
+    # given an evaluator whose child leaves the process group, so it survives the
+    # kill and keeps holding the inherited pipes. The child sleeps just past the
+    # shortened reader deadline: long enough to outlast the join, short enough
+    # that `Popen.__exit__` is not left waiting to close the pipes. The pid goes
+    # to a file so this test can clean up what the code under test cannot.
+    pid_file = tmp_path / "escaper.pid"
+    cmd = _python(
+      "import subprocess, sys, os, time; "
+      "child = subprocess.Popen("
+      "  [sys.executable, '-c', 'import time; time.sleep(3)'], "
+      "  preexec_fn=os.setsid); "
+      f"open({str(pid_file)!r}, 'w').write(str(child.pid)); "
+      "time.sleep(60)"
+    )
+
+    # when it times out.
+    try:
+      with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(common_tools.FunctionExecutionError, match=r"timed-out"),
+      ):
+        common_tools.run_command(cmd, timeout=1)
+    finally:
+      if pid_file.exists():
+        with contextlib.suppress(ProcessLookupError):
+          os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+    # then the undrained output is reported, naming both stuck readers.
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("Output not drained" in w for w in warnings), warnings
+    assert any("stdout" in w and "stderr" in w for w in warnings), warnings
+
+  def test_kills_orphan_that_released_the_output_pipes(self) -> None:
+    """
+    A descendant that closes the output pipes lets the evaluation succeed, but is
+    still cleaned up so it cannot compete with the next evaluation.
+    """
+    # given an evaluator whose child redirects its own output to devnull, so the
+    # pipes drain normally and the result is trustworthy.
+    cmd = _python(
+      "import subprocess, sys; "
+      "child = subprocess.Popen("
+      "  [sys.executable, '-c', 'import time; time.sleep(60)'], "
+      "  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+      "print(child.pid)"
+    )
+
+    # when it is run, then the evaluation succeeds.
+    result = common_tools.run_command(cmd, timeout=30)
+
+    # and the surviving child was still swept up.
+    child_pid = int(result.strip())
+    assert _wait_until_dead(child_pid), (
+      f"orphan {child_pid} was left running after a successful evaluation"
+    )
 
 
 class TestLastOutputLines:
