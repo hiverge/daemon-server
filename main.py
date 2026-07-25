@@ -57,6 +57,39 @@ def lock_sandbox():
   return decorator
 
 
+# How long to let the WSGI server flush the response before exiting.
+_RESTART_GRACE = 1.0
+
+# Guards against scheduling the restart more than once.
+_restart_scheduled = threading.Event()
+
+
+def _restart_container() -> None:
+  """Exit so the container restarts, discarding anything left running in it.
+
+  The daemon is PID 1 in the sandbox container, so ending it ends the container's
+  PID namespace, taking any survivor with it, and the kubelet starts a
+  replacement.
+  """
+  logger.warning(
+    "A process survived this evaluation and is still running on the pod. "
+    "Restarting the container so it cannot affect later measurements."
+  )
+  # `os._exit` skips interpreter cleanup, which would join the abandoned readers.
+  os._exit(1)
+
+
+@app.after_request
+def _restart_if_contaminated(response):
+  """Restart the container once a survivor makes its measurements unreliable."""
+  if common_tools.is_contaminated() and not _restart_scheduled.is_set():
+    _restart_scheduled.set()
+    # After the response: this evaluation ran on a clean pod, only later ones are
+    # at risk.
+    threading.Timer(_RESTART_GRACE, _restart_container).start()
+  return response
+
+
 def execute_python_function(
   code_files: dict[str, str],
   args: list,
@@ -240,7 +273,7 @@ def execute_shell_command(
   # the full lifetime of everything it spawned.
   stdout_lines: list[str] = []
   stderr_lines: list[str] = []
-  with subprocess.Popen(
+  process = subprocess.Popen(
     cmd,
     shell=True,
     cwd=cwd,
@@ -249,7 +282,8 @@ def execute_shell_command(
     encoding="utf-8",
     errors="replace",
     start_new_session=True,
-  ) as process:
+  )
+  try:
     readers = common_tools.start_stream_readers(process, stdout_lines, stderr_lines)
     try:
       returncode = process.wait(timeout=timeout)
@@ -263,6 +297,8 @@ def execute_shell_command(
     # command has no single result line that a leaked process could invalidate.
     common_tools.kill_process_group(process)
     drained = common_tools.join_stream_readers(readers)
+  finally:
+    common_tools.release_process(process)
 
   if timed_out:
     output = f"Error: command timed out after {timeout}s"

@@ -68,6 +68,21 @@ READER_JOIN_TIMEOUT = 5.0
 # uninterruptible syscall can outlast it.
 PROCESS_GROUP_KILL_TIMEOUT = 5.0
 
+# Set when a command leaves a process this daemon could not kill. The survivor
+# competes for CPU, memory and I/O with whatever runs next, so a candidate timed
+# against it is scored on a machine that is not idle.
+_contaminated = threading.Event()
+
+
+def mark_contaminated() -> None:
+  """Record that a process survived this daemon's attempt to kill it."""
+  _contaminated.set()
+
+
+def is_contaminated() -> bool:
+  """Whether a command left a process this daemon could not kill."""
+  return _contaminated.is_set()
+
 
 def _format_stream_tail(name: str, output: str, max_lines: int) -> str:
   """Format the tail of a single output stream with an underlined header.
@@ -193,9 +208,26 @@ def join_stream_readers(readers: Sequence[threading.Thread]) -> bool:
       READER_JOIN_TIMEOUT,
       ", ".join(stuck),
     )
+    mark_contaminated()
     return False
 
   return True
+
+
+def release_process(process: subprocess.Popen) -> None:
+  """Reap `process`, waiting at most `PROCESS_GROUP_KILL_TIMEOUT`.
+
+  The output pipes are left to the reader threads, which close them in
+  `read_stream`'s `finally`. Closing a stream blocks while a reader thread is
+  inside `readline` on it, for as long as whatever holds the pipe open.
+  """
+  try:
+    process.wait(timeout=PROCESS_GROUP_KILL_TIMEOUT)
+  except subprocess.TimeoutExpired:
+    # The group was already sent SIGKILL, so the process is wedged in the kernel
+    # and stays a zombie until the container restarts.
+    logger.warning("Process %d could not be reaped.", process.pid)
+    mark_contaminated()
 
 
 def run_command(
@@ -221,7 +253,7 @@ def run_command(
   # Also configure Python to use unbuffered output so we can stream the output 
   env["PYTHONUNBUFFERED"] = "1"
 
-  with subprocess.Popen(
+  process = subprocess.Popen(
     cmd,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -233,7 +265,8 @@ def run_command(
     # Own process group, so everything the command spawns can be cleaned up
     # together. See `kill_process_group`.
     start_new_session=True,
-  ) as process:
+  )
+  try:
     # `read_stream` logs every line live, so only the last
     # `MAX_ERROR_OUTPUT_LINES` of each stream are retained here: enough for the
     # error tail and the final stdout line, and bounded no matter how much the
@@ -286,6 +319,8 @@ def run_command(
       # Exited cleanly but printed nothing, so there is no result to parse.
       raise FunctionExecutionError("Evaluator Format Error: No output was written.")
     return lines[-1]  # Return only the last line of output
+  finally:
+    release_process(process)
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:

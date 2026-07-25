@@ -199,8 +199,12 @@ class TestOrphanedDescendants:
 
   @pytest.fixture(autouse=True)
   def _short_join_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Shorten the reader deadline so these tests stay fast."""
+    """
+    Shorten the reader deadline so these tests stay fast, and clear the
+    process-wide contamination flag.
+    """
     monkeypatch.setattr(common_tools, "READER_JOIN_TIMEOUT", 1.0)
+    common_tools._contaminated.clear()
 
   def test_returns_promptly_when_orphan_holds_output(self) -> None:
     """
@@ -266,10 +270,9 @@ class TestOrphanedDescendants:
     only place its leaked descendant surfaces.
     """
     # given an evaluator whose child leaves the process group, so it survives the
-    # kill and keeps holding the inherited pipes. The child sleeps just past the
-    # shortened reader deadline: long enough to outlast the join, short enough
-    # that `Popen.__exit__` is not left waiting to close the pipes. The pid goes
-    # to a file so this test can clean up what the code under test cannot.
+    # kill and keeps holding the inherited pipes. It outlives the shortened reader
+    # deadline, so the join has to give up on it. The pid goes to a file so this
+    # test can clean up what the code under test cannot.
     pid_file = tmp_path / "escaper.pid"
     cmd = _python(
       "import subprocess, sys, os, time; "
@@ -296,6 +299,45 @@ class TestOrphanedDescendants:
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert any("Output not drained" in w for w in warnings), warnings
     assert any("stdout" in w and "stderr" in w for w in warnings), warnings
+
+  def test_returns_on_its_own_deadline_when_a_descendant_escapes_the_group(
+    self, tmp_path: pathlib.Path
+  ) -> None:
+    """
+    A descendant that escapes the process group cannot extend the call, and is
+    recorded as contaminating the pod.
+    """
+    # given an evaluator whose child escapes the process group and holds the pipes
+    # for far longer than any deadline in play.
+    pid_file = tmp_path / "escaper.pid"
+    cmd = _python(
+      "import subprocess, sys, os; "
+      "child = subprocess.Popen("
+      "  [sys.executable, '-c', 'import time; time.sleep(30)'], "
+      "  preexec_fn=os.setsid); "
+      f"open({str(pid_file)!r}, 'w').write(str(child.pid)); "
+      "print('fitness: 1.0')"
+    )
+
+    # when it is run.
+    start = time.monotonic()
+    try:
+      with pytest.raises(
+        common_tools.FunctionExecutionError,
+        match=r"left background processes still holding its output",
+      ):
+        common_tools.run_command(cmd, timeout=30)
+      elapsed = time.monotonic() - start
+    finally:
+      if pid_file.exists():
+        with contextlib.suppress(ProcessLookupError):
+          os.kill(int(pid_file.read_text()), signal.SIGKILL)
+
+    # then it returned on its own deadline, nowhere near the escapee's 30s.
+    assert elapsed < 10, f"took {elapsed:.1f}s, so cleanup waited on the escapee"
+
+    # and the pod is marked unfit for further measurements.
+    assert common_tools.is_contaminated()
 
   def test_kills_orphan_that_released_the_output_pipes(self) -> None:
     """

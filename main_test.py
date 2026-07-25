@@ -1,7 +1,9 @@
 """Tests for the main module."""
 
+import contextlib
 import os
 import pathlib
+import signal
 import sys
 import time
 
@@ -9,6 +11,25 @@ import pytest
 
 import common_tools
 import main
+
+
+class _Response:
+  """
+  Stand-in for the Flask response that `after_request` hooks receive and return.
+  """
+
+
+class _FakeTimer:
+  """
+  Stand-in for `threading.Timer` that records the delay instead of arming a timer.
+  """
+
+  def __init__(self, delay: float, recorder: list[float]) -> None:
+    self._delay = delay
+    self._recorder = recorder
+
+  def start(self) -> None:
+    self._recorder.append(self._delay)
 
 
 def _wait_until_dead(pid: int, timeout: float = 5.0) -> bool:
@@ -52,6 +73,9 @@ class TestShellCommandDescendants:
     monkeypatch.setattr(main, "BACKUP_DIR", f"{backup}/")
     monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
     monkeypatch.setattr(common_tools, "READER_JOIN_TIMEOUT", 1.0)
+    # Process-wide, so it outlives a single test.
+    common_tools._contaminated.clear()
+    main._restart_scheduled.clear()
     self.repo = repo
     return repo
 
@@ -128,31 +152,53 @@ class TestShellCommandDescendants:
     output that did arrive is still returned.
     """
     # given a command whose child leaves the process group, so it survives the
-    # kill and keeps holding the inherited pipes. The child sleeps just past the
-    # shortened reader deadline: long enough to outlast the join, short enough
-    # that closing the pipes is not left waiting. The pid goes to a file so this
-    # test can clean up what the code under test cannot.
+    # kill and keeps holding the inherited pipes for longer than any deadline in
+    # play. The pid goes to a file so this test can clean up what the code under
+    # test cannot.
     pid_file = tmp_path / "escaper.pid"
     cmd = (
       f"{sys.executable} -c "
       "'import subprocess, sys, os; "
       "child = subprocess.Popen("
-      "  [sys.executable, \"-c\", \"import time; time.sleep(3)\"], "
+      "  [sys.executable, \"-c\", \"import time; time.sleep(30)\"], "
       "  preexec_fn=os.setsid); "
       f'open("{pid_file}", "w").write(str(child.pid)); '
       "print(\"partial output\")'"
     )
 
     # when it is run.
+    start = time.monotonic()
     try:
       output = self._run(cmd)
+      elapsed = time.monotonic() - start
     finally:
       if pid_file.exists():
-        try:
-          os.kill(int(pid_file.read_text()), 9)
-        except ProcessLookupError:
-          pass
+        with contextlib.suppress(ProcessLookupError):
+          os.kill(int(pid_file.read_text()), signal.SIGKILL)
 
     # then the output that arrived is returned, flagged as incomplete.
     assert "partial output" in output
     assert "[Output truncated" in output
+
+    # and it returned on its own deadline, nowhere near the escapee's 30s.
+    assert elapsed < 10, f"took {elapsed:.1f}s, so cleanup waited on the escapee"
+
+  def test_schedules_one_restart_once_the_pod_is_contaminated(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """
+    A survivor triggers exactly one container restart, however many responses
+    follow it.
+    """
+    # given a contaminated pod, and a stand-in for the timer so the exit never
+    # runs here.
+    restarts: list[float] = []
+    monkeypatch.setattr(main.threading, "Timer", lambda delay, fn: _FakeTimer(delay, restarts))
+    common_tools.mark_contaminated()
+
+    # when several responses go out.
+    for _ in range(3):
+      main._restart_if_contaminated(_Response())
+
+    # then the restart was scheduled once, not once per request.
+    assert restarts == [main._RESTART_GRACE]
