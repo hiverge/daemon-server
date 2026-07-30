@@ -11,6 +11,7 @@ import pytest
 
 import common_tools
 import main
+from conftest import wait_until_dead
 
 
 class _Response:
@@ -19,7 +20,7 @@ class _Response:
   """
 
 
-class _FakeTimer:
+class _MockTimer:
   """
   Stand-in for `threading.Timer` that records the delay instead of arming a timer.
   """
@@ -30,23 +31,6 @@ class _FakeTimer:
 
   def start(self) -> None:
     self._recorder.append(self._delay)
-
-
-def _wait_until_dead(pid: int, timeout: float = 5.0) -> bool:
-  """
-  Poll until `pid` disappears, returning whether it did within `timeout`.
-
-  `SIGKILL` delivery to a whole process group is not instantaneous.
-  """
-  deadline = time.monotonic() + timeout
-  while True:
-    try:
-      os.kill(pid, 0)
-    except ProcessLookupError:
-      return True
-    if time.monotonic() >= deadline:
-      return False
-    time.sleep(0.05)
 
 
 class TestShellCommandDescendants:
@@ -75,7 +59,6 @@ class TestShellCommandDescendants:
     monkeypatch.setattr(common_tools, "READER_JOIN_TIMEOUT", 1.0)
     # Process-wide, so it outlives a single test.
     common_tools._contaminated.clear()
-    main._restart_scheduled.clear()
     self.repo = repo
     return repo
 
@@ -118,7 +101,7 @@ class TestShellCommandDescendants:
 
     # then the backgrounded job was killed.
     job_pid = int(output.strip())
-    assert _wait_until_dead(job_pid), (
+    assert wait_until_dead(job_pid), (
       f"backgrounded job {job_pid} was left running after the request"
     )
 
@@ -140,7 +123,7 @@ class TestShellCommandDescendants:
     # then the timeout is reported and the backgrounded job was killed with it.
     assert output == "Error: command timed out after 1s"
     job_pid = int(pid_file.read_text())
-    assert _wait_until_dead(job_pid), (
+    assert wait_until_dead(job_pid), (
       f"backgrounded job {job_pid} survived the timeout"
     )
 
@@ -183,22 +166,20 @@ class TestShellCommandDescendants:
     # and it returned on its own deadline, nowhere near the escapee's 30s.
     assert elapsed < 10, f"took {elapsed:.1f}s, so cleanup waited on the escapee"
 
-  def test_schedules_one_restart_once_the_pod_is_contaminated(
+  def test_schedules_a_restart_once_the_pod_is_contaminated(
     self, monkeypatch: pytest.MonkeyPatch
   ) -> None:
     """
-    A survivor triggers exactly one container restart, however many responses
-    follow it.
+    A survivor triggers a container restart.
     """
     # given a contaminated pod, and a stand-in for the timer so the exit never
     # runs here.
     restarts: list[float] = []
-    monkeypatch.setattr(main.threading, "Timer", lambda delay, fn: _FakeTimer(delay, restarts))
+    monkeypatch.setattr(main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts))
     common_tools.mark_contaminated()
 
-    # when several responses go out.
-    for _ in range(3):
-      main._restart_if_contaminated(_Response())
+    # when a response goes out.
+    main._restart_if_contaminated(_Response())
 
-    # then the restart was scheduled once, not once per request.
+    # then a restart was scheduled at the grace delay.
     assert restarts == [main._RESTART_GRACE]

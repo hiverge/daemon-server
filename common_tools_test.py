@@ -5,12 +5,14 @@ import logging
 import os
 import pathlib
 import signal
+import subprocess
 import sys
 import time
 
 import pytest
 
 import common_tools
+from conftest import wait_until_dead
 
 
 def _python(code: str) -> list[str]:
@@ -18,23 +20,6 @@ def _python(code: str) -> list[str]:
   Build a command that runs the given Python source in a subprocess.
   """
   return [sys.executable, "-c", code]
-
-
-def _wait_until_dead(pid: int, timeout: float = 5.0) -> bool:
-  """
-  Poll until `pid` disappears, returning whether it did within `timeout`.
-
-  `SIGKILL` delivery to a whole process group is not instantaneous.
-  """
-  deadline = time.monotonic() + timeout
-  while True:
-    try:
-      os.kill(pid, 0)
-    except ProcessLookupError:
-      return True
-    if time.monotonic() >= deadline:
-      return False
-    time.sleep(0.05)
 
 
 class TestRunCommand:
@@ -230,6 +215,30 @@ class TestOrphanedDescendants:
     # and it returns on the reader deadline, not the child's 60s lifetime.
     assert time.monotonic() - start < 20
 
+  def test_kills_the_evaluator_when_the_run_fails_unexpectedly(
+    self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+    """
+    A failure on a path with no explicit kill still leaves nothing running.
+    """
+    # given a run that raises straight after the spawn, before anything drains or
+    # kills the process group.
+    pids: list[int] = []
+
+    def fail(process: subprocess.Popen, *_: object) -> None:
+      pids.append(process.pid)
+      raise RuntimeError("boom")
+
+    monkeypatch.setattr(common_tools, "start_stream_readers", fail)
+
+    # when it is run, then the failure propagates.
+    with pytest.raises(RuntimeError, match="boom"):
+      common_tools.run_command(_python("import time; time.sleep(60)"), timeout=30)
+
+    # and the evaluator was killed and reaped, so the pod needs no restart.
+    assert wait_until_dead(pids[0])
+    assert not common_tools.is_contaminated()
+
   def test_kills_orphan_that_outlives_a_timed_out_evaluator(
     self, tmp_path: pathlib.Path
   ) -> None:
@@ -256,7 +265,7 @@ class TestOrphanedDescendants:
 
     # and the orphaned child was killed along with it.
     child_pid = int(pid_file.read_text())
-    assert _wait_until_dead(child_pid), (
+    assert wait_until_dead(child_pid), (
       f"orphan {child_pid} survived the timeout and is still running on the pod"
     )
 
@@ -359,7 +368,7 @@ class TestOrphanedDescendants:
 
     # and the surviving child was still swept up.
     child_pid = int(result.strip())
-    assert _wait_until_dead(child_pid), (
+    assert wait_until_dead(child_pid), (
       f"orphan {child_pid} was left running after a successful evaluation"
     )
 

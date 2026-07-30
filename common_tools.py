@@ -1,5 +1,6 @@
 """Common functionality across sandboxex."""
 
+import contextlib
 import io
 import logging
 import os
@@ -8,7 +9,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import MutableSequence, Sequence
+from collections.abc import Generator, MutableSequence, Sequence
 from typing import IO
 
 import requests
@@ -27,7 +28,8 @@ def read_stream(
       output_list.append(line)
       logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError, ValueError) as e:
-    # ValueError: the stream was closed underneath us.
+    # ValueError("I/O operation on closed file"): an abandoned reader's `finally`
+    # closes the stream mid-`readline`, and a stray traceback would litter the log.
     output_list.append(f"[Error reading stream] {e}")
   finally:
     stream.close()
@@ -221,6 +223,20 @@ def release_process(process: subprocess.Popen) -> None:
     mark_contaminated()
 
 
+@contextlib.contextmanager
+def sandboxed_process(
+  process: subprocess.Popen,
+) -> Generator[subprocess.Popen, None, None]:
+  """Kill and reap `process`'s group on the way out, however the block ends."""
+  try:
+    yield process
+  finally:
+    # A reaped leader's pid can already belong to an unrelated group.
+    if process.poll() is None:
+      kill_process_group(process)
+    release_process(process)
+
+
 def run_command(
   cmd: str | Sequence[str],
   cwd: str = ".",
@@ -257,7 +273,7 @@ def run_command(
     # together. See `kill_process_group`.
     start_new_session=True,
   )
-  try:
+  with sandboxed_process(process):
     # `read_stream` logs every line live, so only the last
     # `MAX_ERROR_OUTPUT_LINES` of each stream are retained here: enough for the
     # error tail and the final stdout line, and bounded no matter how much the
@@ -310,8 +326,6 @@ def run_command(
       # Exited cleanly but printed nothing, so there is no result to parse.
       raise FunctionExecutionError("Evaluator Format Error: No output was written.")
     return lines[-1]  # Return only the last line of output
-  finally:
-    release_process(process)
 
 
 def wait_for_url(url: str, timeout: int = 300, interval: int = 1) -> bool:

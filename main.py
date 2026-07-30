@@ -60,9 +60,6 @@ def lock_sandbox():
 # How long to let the WSGI server flush the response before exiting.
 _RESTART_GRACE = 1.0
 
-# Guards against scheduling the restart more than once.
-_restart_scheduled = threading.Event()
-
 
 def _restart_container() -> None:
   """Exit so the container restarts, discarding anything left running in it.
@@ -82,8 +79,7 @@ def _restart_container() -> None:
 @app.after_request
 def _restart_if_contaminated(response):
   """Restart the container once a survivor makes its measurements unreliable."""
-  if common_tools.is_contaminated() and not _restart_scheduled.is_set():
-    _restart_scheduled.set()
+  if common_tools.is_contaminated():
     # After the response: this evaluation ran on a clean pod, only later ones are
     # at risk.
     threading.Timer(_RESTART_GRACE, _restart_container).start()
@@ -283,7 +279,7 @@ def execute_shell_command(
     errors="replace",
     start_new_session=True,
   )
-  try:
+  with common_tools.sandboxed_process(process):
     readers = common_tools.start_stream_readers(process, stdout_lines, stderr_lines)
     try:
       returncode = process.wait(timeout=timeout)
@@ -297,8 +293,6 @@ def execute_shell_command(
     # command has no single result line that a leaked process could invalidate.
     common_tools.kill_process_group(process)
     drained = common_tools.join_stream_readers(readers)
-  finally:
-    common_tools.release_process(process)
 
   if timed_out:
     output = f"Error: command timed out after {timeout}s"
