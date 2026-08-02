@@ -275,18 +275,8 @@ class TestOrphanedDescendants:
     """
     An evaluator that overruns while holding an open worker pool still fails with
     the timeout.
-
-    This is the shape that stalled the QAOA experiment. Nothing in the evaluator
-    spawns a process explicitly: a `ProcessPoolExecutor` keeps its workers parked
-    between submissions, so they outlive the tasks, holding the inherited pipes,
-    until the pool is shut down. `SIGKILL` runs no `__exit__` and no `atexit`, so
-    killing only the evaluator left all ten of them running and the pipes never
-    ended. Task duration is irrelevant -- an idle pool holds them just as a busy
-    one does.
     """
-    # given an evaluator that fills a pool, leaves it open, and then overruns. It
-    # has to be a file rather than `python -c`, because a spawned worker
-    # re-imports the module to find its task function.
+    # given an evaluator that fills a pool, leaves it open, and then overruns
     script = tmp_path / "pool_evaluator.py"
     script.write_text(
       "import concurrent.futures, time\n"
