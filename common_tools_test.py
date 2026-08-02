@@ -269,6 +269,50 @@ class TestOrphanedDescendants:
       f"orphan {child_pid} survived the timeout and is still running on the pod"
     )
 
+  def test_returns_when_a_timed_out_evaluator_holds_an_open_worker_pool(
+    self, tmp_path: pathlib.Path
+  ) -> None:
+    """
+    An evaluator that overruns while holding an open worker pool still fails with
+    the timeout.
+
+    This is the shape that stalled the QAOA experiment. Nothing in the evaluator
+    spawns a process explicitly: a `ProcessPoolExecutor` keeps its workers parked
+    between submissions, so they outlive the tasks, holding the inherited pipes,
+    until the pool is shut down. `SIGKILL` runs no `__exit__` and no `atexit`, so
+    killing only the evaluator left all ten of them running and the pipes never
+    ended. Task duration is irrelevant -- an idle pool holds them just as a busy
+    one does.
+    """
+    # given an evaluator that fills a pool, leaves it open, and then overruns. It
+    # has to be a file rather than `python -c`, because a spawned worker
+    # re-imports the module to find its task function.
+    script = tmp_path / "pool_evaluator.py"
+    script.write_text(
+      "import concurrent.futures, time\n"
+      "\n"
+      "def noop(i):\n"
+      "  return i\n"
+      "\n"
+      "if __name__ == '__main__':\n"
+      "  pool = concurrent.futures.ProcessPoolExecutor(max_workers=10)\n"
+      "  list(pool.map(noop, range(10)))\n"
+      "  time.sleep(60)\n"
+    )
+
+    # when it is run with a short timeout, then the timeout is reported. The
+    # absence of this message was the original symptom: it follows the reader
+    # join, which waited forever on an end-of-stream the workers withheld.
+    start = time.monotonic()
+    with pytest.raises(
+      common_tools.FunctionExecutionError,
+      match=r"Evaluation timed-out",
+    ):
+      common_tools.run_command([sys.executable, str(script)], timeout=1)
+
+    # and it returned on its own deadline, not the evaluator's 60s.
+    assert time.monotonic() - start < 20
+
   def test_warns_when_output_cannot_be_drained(
     self, caplog: pytest.LogCaptureFixture, tmp_path: pathlib.Path
   ) -> None:
