@@ -269,6 +269,38 @@ class TestOrphanedDescendants:
       f"orphan {child_pid} survived the timeout and is still running on the pod"
     )
 
+  def test_returns_when_a_timed_out_evaluator_holds_an_open_worker_pool(
+    self, tmp_path: pathlib.Path
+  ) -> None:
+    """
+    An evaluator that overruns while holding an open worker pool still fails with
+    the timeout.
+    """
+    # this evaluator will overrun because its pool workers are still
+    # working, each holding a copy of the evaluator's stdout and stderr.
+    script = tmp_path / "pool_evaluator.py"
+    script.write_text(
+      "import concurrent.futures, time\n"
+      "\n"
+      "def work(i):\n"
+      "  time.sleep(30)\n"
+      "  return i\n"
+      "\n"
+      "if __name__ == '__main__':\n"
+      "  pool = concurrent.futures.ProcessPoolExecutor(max_workers=2)\n"
+      "  list(pool.map(work, range(2)))\n"
+    )
+
+    start = time.monotonic()
+    with pytest.raises(
+      common_tools.FunctionExecutionError,
+      match=r"Evaluation timed-out",
+    ):
+      common_tools.run_command([sys.executable, str(script)], timeout=5)
+
+    # check that the test didn't block on the pool workers' 30s sleep.
+    assert time.monotonic() - start < 10
+
   def test_warns_when_output_cannot_be_drained(
     self, caplog: pytest.LogCaptureFixture, tmp_path: pathlib.Path
   ) -> None:
