@@ -1,14 +1,25 @@
 #!/bin/bash
 set -e
 
-# Build hive-webserver binary for Linux amd64
-# This creates a standalone executable that bundles Python + all dependencies
+# Build the daemon-server binary for a given Linux architecture.
+# This creates a standalone executable that bundles Python + all dependencies.
+#
+# Usage: build-binary.sh [amd64|arm64]   (default: amd64)
+#
+# The binary is a PyInstaller freeze, so it is architecture-specific.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+ARCH="${1:-amd64}"
+case "$ARCH" in
+    amd64) DOCKER_PLATFORM="linux/amd64"; MANYLINUX="quay.io/pypa/manylinux2014_x86_64" ;;
+    arm64) DOCKER_PLATFORM="linux/arm64"; MANYLINUX="quay.io/pypa/manylinux2014_aarch64" ;;
+    *) echo "ERROR: unsupported arch '$ARCH' (want amd64 or arm64)"; exit 1 ;;
+esac
+
 echo "=========================================="
-echo "Building daemon-server binary (linux/amd64)"
+echo "Building daemon-server binary (${DOCKER_PLATFORM})"
 echo "=========================================="
 
 # Check if Docker is running
@@ -24,10 +35,10 @@ rm -rf build/ dist/
 # Build binary using PyInstaller in Docker
 echo "Building binary (this may take 2-3 minutes)..."
 docker run --rm -i \
-    --platform linux/amd64 \
+    --platform "$DOCKER_PLATFORM" \
     -v "$PWD:/src" \
     -w /src \
-    quay.io/pypa/manylinux2014_x86_64 bash -s <<'DOCKER_BUILD'
+    "$MANYLINUX" bash -s <<'DOCKER_BUILD'
 set -e
 PYTHON_VERSION=3.12.8
 
@@ -63,22 +74,23 @@ echo 'Running PyInstaller...'
 echo 'Build complete!'
 DOCKER_BUILD
 
-# Check if build succeeded and rename with architecture
+# Check if build succeeded and save under the arch-specific asset name the
+# hive-operator downloads (daemon-server-linux-<arch>).
 if [ -f dist/daemon-server ]; then
-    cp dist/daemon-server dist/daemon-server-linux-amd64
-    SIZE=$(du -h dist/daemon-server | cut -f1)
+    ASSET="dist/daemon-server-linux-${ARCH}"
+    cp dist/daemon-server "$ASSET"
+    SIZE=$(du -h "$ASSET" | cut -f1)
     echo ""
     echo "=========================================="
     echo "SUCCESS! Binary built successfully"
     echo "=========================================="
-    echo "Location: dist/daemon-server"
-    echo "Also saved as: dist/daemon-server-linux-amd64"
+    echo "Location: $ASSET"
     echo "Size: $SIZE"
-    echo "Platform: Linux x86_64 (amd64)"
+    echo "Platform: ${DOCKER_PLATFORM}"
     echo ""
     echo "Next steps:"
-    echo "1. Test locally: docker run --rm -v \$PWD/dist:/app alpine /app/daemon-server"
-    echo "2. Build container: docker build -f Dockerfile.binary -t your-registry/daemon-server:latest ."
+    echo "1. Test locally: docker run --rm --platform ${DOCKER_PLATFORM} -v \$PWD/dist:/app alpine /app/daemon-server-linux-${ARCH}"
+    echo "2. Release: ./build-and-release.sh <version>"
 else
     echo ""
     echo "ERROR: Build failed - binary not found at dist/daemon-server"

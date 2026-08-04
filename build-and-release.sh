@@ -36,34 +36,40 @@ if ! gh auth status &> /dev/null; then
     exit 1
 fi
 
-# Build binary (unless skipped)
+# Architectures to build and release.
+ARCHES=(amd64 arm64)
+
+# Build binaries (unless skipped)
 if [ "$SKIP_BUILD" != "true" ]; then
-    echo ""
-    echo "Step 1: Building binary..."
-    ./build-binary.sh
+    for arch in "${ARCHES[@]}"; do
+        echo ""
+        echo "Step 1: Building binary ($arch)..."
+        ./build-binary.sh "$arch"
+    done
 else
     echo ""
     echo "Step 1: Skipping build (SKIP_BUILD=true)"
 fi
 
-# Check if binary exists
-if [ ! -f dist/daemon-server ]; then
-    echo "ERROR: Binary not found at dist/daemon-server"
-    echo "Run build-binary.sh first or set SKIP_BUILD=false"
-    exit 1
-fi
-
-# Generate checksum
+# Verify every arch asset exists and generate per-asset checksums.
 echo ""
-echo "Step 2: Generating checksum..."
+echo "Step 2: Verifying assets and generating checksums..."
+ASSETS=()
 cd dist
-sha256sum daemon-server > daemon-server.sha256
-SHA256=$(cat daemon-server.sha256 | cut -d' ' -f1)
-SIZE=$(du -h daemon-server | cut -f1)
+for arch in "${ARCHES[@]}"; do
+    asset="daemon-server-linux-${arch}"
+    if [ ! -f "$asset" ]; then
+        echo "ERROR: asset not found at dist/${asset}"
+        echo "Run build-binary.sh ${arch} first or set SKIP_BUILD=false"
+        exit 1
+    fi
+    sha256sum "$asset" > "${asset}.sha256"
+    sha=$(cut -d' ' -f1 < "${asset}.sha256")
+    size=$(du -h "$asset" | cut -f1)
+    echo "  ${asset}: size=${size} sha256=${sha}"
+    ASSETS+=("$asset" "${asset}.sha256")
+done
 cd ..
-
-echo "  Binary size: $SIZE"
-echo "  SHA256: $SHA256"
 
 # Check if release already exists
 echo ""
@@ -77,18 +83,17 @@ if gh release view "$VERSION" &> /dev/null; then
     else
         echo "  Uploading to existing release..."
         gh release upload "$VERSION" \
-            dist/daemon-server \
-            dist/daemon-server.sha256 \
+            "${ASSETS[@]/#/dist/}" \
             --clobber
 
         echo ""
         echo "=========================================="
-        echo "SUCCESS! Binary updated in release"
+        echo "SUCCESS! Binaries updated in release"
         echo "=========================================="
-        echo "Download URL:"
-        echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server"
-        echo ""
-        echo "SHA256: $SHA256"
+        REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+        for arch in "${ARCHES[@]}"; do
+            echo "  https://github.com/${REPO}/releases/download/${VERSION}/daemon-server-linux-${arch}"
+        done
         exit 0
     fi
 fi
@@ -96,30 +101,35 @@ fi
 # Create release
 echo ""
 echo "Step 4: Creating GitHub release..."
-gh release create "$VERSION" \
-    dist/daemon-server \
-    dist/daemon-server.sha256 \
-    --title "Daemon Server Binary $VERSION" \
-    --notes "**Daemon Server Binary for Linux AMD64**
+REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 
-Size: $SIZE
-SHA256: \`$SHA256\`
+# Assemble per-arch download instructions for the release notes.
+DL_DOC=""
+for arch in "${ARCHES[@]}"; do
+    asset="daemon-server-linux-${arch}"
+    DL_DOC+="# ${arch}
+curl -L -o daemon-server \\
+  https://github.com/${REPO}/releases/download/${VERSION}/${asset}
+curl -L -o daemon-server.sha256 \\
+  https://github.com/${REPO}/releases/download/${VERSION}/${asset}.sha256
+sha256sum -c daemon-server.sha256
+chmod +x daemon-server
+
+"
+done
+
+gh release create "$VERSION" \
+    "${ASSETS[@]/#/dist/}" \
+    --title "Daemon Server Binary $VERSION" \
+    --notes "**Daemon Server Binaries for Linux (${ARCHES[*]})**
+
+Each architecture is published as \`daemon-server-linux-<arch>\` with a matching
+\`.sha256\`. The hive-operator downloads the asset matching the sandbox's arch.
 
 ## Download
 
 \`\`\`bash
-# Download binary
-curl -L -o daemon-server \\
-  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server
-
-# Verify checksum
-curl -L -o daemon-server.sha256 \\
-  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server.sha256
-sha256sum -c daemon-server.sha256
-
-# Make executable
-chmod +x daemon-server
-\`\`\`
+${DL_DOC}\`\`\`
 
 ## Usage
 
@@ -136,9 +146,9 @@ echo ""
 echo "=========================================="
 echo "SUCCESS! Release created"
 echo "=========================================="
-echo "View release: https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/tag/$VERSION"
+echo "View release: https://github.com/${REPO}/releases/tag/$VERSION"
 echo ""
-echo "Download URL:"
-echo "  https://github.com/$(gh repo view --json nameWithOwner -q .nameWithOwner)/releases/download/$VERSION/daemon-server"
-echo ""
-echo "SHA256: $SHA256"
+echo "Download URLs:"
+for arch in "${ARCHES[@]}"; do
+    echo "  https://github.com/${REPO}/releases/download/${VERSION}/daemon-server-linux-${arch}"
+done
