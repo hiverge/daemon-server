@@ -96,7 +96,10 @@ def execute_python_function(
   # Restore the original repository state using rsync
   subprocess.run(["rsync", "-a", "--delete", BACKUP_DIR, REPO_DIR])
 
-  args = [f'"{arg}"' if isinstance(arg, str) else f"{arg}" for arg in args]
+  # Stringify only. The command below goes to `Popen` as a list with no shell, so
+  # nothing splits on whitespace and nothing strips quotes: adding them would put
+  # the quote characters inside `sys.argv[n]`.
+  args = [str(arg) for arg in args]
 
   for rel_path, range_and_content in code_files.items():
     with open(os.path.join(REPO_DIR, rel_path), "w", encoding="utf-8") as f:

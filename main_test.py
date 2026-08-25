@@ -1,6 +1,7 @@
 """Tests for the main module."""
 
 import contextlib
+import json
 import os
 import pathlib
 import signal
@@ -31,6 +32,99 @@ class _MockTimer:
 
   def start(self) -> None:
     self._recorder.append(self._delay)
+
+
+class TestEvaluationArguments:
+  """
+  Tests that the arguments a caller passes reach the evaluation script verbatim.
+
+  `run_command` hands the command to `Popen` as a list with no shell, so the
+  server must not quote or escape anything: whatever it puts in the list is
+  exactly what lands in `sys.argv`.
+  """
+
+  # Echoes its own arguments back as the last line, i.e. the evaluator contract.
+  _ECHO_ARGV = (
+    "import json, sys\n"
+    'print(json.dumps({"status": "success", "result": {"argv": sys.argv[1:]}}))\n'
+  )
+
+  @pytest.fixture(autouse=True)
+  def _sandbox(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    """
+    Point the server at throwaway directories.
+    """
+    repo = tmp_path / "repo"
+    backup = tmp_path / "backup"
+    repo.mkdir()
+    backup.mkdir()
+    monkeypatch.setattr(main, "REPO_DIR", f"{repo}/")
+    monkeypatch.setattr(main, "BACKUP_DIR", f"{backup}/")
+    # The server resolves the interpreter from the environment at call time.
+    monkeypatch.setenv("PYTHON_EXECUTABLE", sys.executable)
+    # Stub the pre-run `rsync` restore: these tests are about what reaches
+    # `sys.argv`, and rsync only exists in the sandbox image, not on every dev
+    # machine. `run_command` uses `Popen`, so the evaluation itself still runs.
+    monkeypatch.setattr(main.subprocess, "run", lambda *a, **k: None)
+
+  def _argv_for(self, args: list) -> list[str]:
+    """
+    Run the echo script with `args` and return the `sys.argv[1:]` it saw.
+    """
+    output = main.execute_python_function(
+      {"echo_argv.py": self._ECHO_ARGV}, args, 30, "echo_argv.py"
+    )
+    return json.loads(output)["result"]["argv"]
+
+  def test_passes_arguments_through_unquoted(self) -> None:
+    """
+    Arguments arrive in `sys.argv` exactly as given, with no added quoting.
+    """
+    # given a mix of a bare value and a multi-token argument list.
+    args = ["1", "subcommand", "-n", "512"]
+
+    # when the evaluation script is run with them.
+    argv = self._argv_for(args)
+
+    # then it saw them verbatim.
+    assert argv == ["1", "subcommand", "-n", "512"]
+    assert not any('"' in arg for arg in argv)
+
+  def test_stringifies_non_string_arguments(self) -> None:
+    """
+    A YAML-numeric argument reaches the script as its decimal string.
+    """
+    # given a numeric argument.
+    args = [512]
+
+    # when the evaluation script is run with it.
+    argv = self._argv_for(args)
+
+    # then it arrived as a plain string.
+    assert argv == ["512"]
+
+  def test_writes_code_files_before_running(self) -> None:
+    """
+    Files supplied with the request are in the repo by the time the script runs,
+    so a caller can deliver an input file alongside the arguments naming it.
+    """
+    # given a script that reads a data file supplied in the same request.
+    code_files = {
+      "read_input.py": (
+        "import json, sys\n"
+        'print(json.dumps({"status": "success", '
+        '"result": {"data": open(sys.argv[1]).read()}}))\n'
+      ),
+      "input.json": '["a", "b"]',
+    }
+
+    # when it is run with that file's path as its argument.
+    output = main.execute_python_function(
+      code_files, ["input.json"], 30, "read_input.py"
+    )
+
+    # then the script read the file the request delivered.
+    assert json.loads(output)["result"]["data"] == '["a", "b"]'
 
 
 class TestShellCommandDescendants:
