@@ -5,6 +5,7 @@ description = "Standalone daemon server for executing code and health checks in 
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "aiohttp>=3.9.0",
   "flask>=3.0.0",
   "waitress>=3.0.0",
   "requests>=2.31.0",
