@@ -86,8 +86,28 @@ def _restart_if_contaminated(response):
   return response
 
 
+def _resolve_repo_path(
+  rel_path: str, *, follow_final_symlink: bool = True
+) -> Path:
+  """Resolve an overlay path and require it to remain inside the repository.
+
+  Writes follow the final symlink, matching normal file-open behaviour. Deletions
+  resolve only the parent so unlinking removes the named symlink itself.
+  """
+  repo_root = Path(REPO_DIR).resolve()
+  requested_path = repo_root / rel_path
+  full_path = (
+    requested_path.resolve()
+    if follow_final_symlink
+    else requested_path.parent.resolve() / requested_path.name
+  )
+  if not full_path.is_relative_to(repo_root):
+    raise ValueError(f"Path escapes repo directory: {rel_path}")
+  return full_path
+
+
 def execute_python_function(
-  code_files: dict[str, str],
+  code_files: dict[str, Optional[str]],
   args: list,
   timeout: float,
   evaluation_script: str,
@@ -102,7 +122,12 @@ def execute_python_function(
   args = [str(arg) for arg in args]
 
   for rel_path, range_and_content in code_files.items():
-    with open(os.path.join(REPO_DIR, rel_path), "w", encoding="utf-8") as f:
+    if range_and_content is None:
+      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
+      full_path.unlink(missing_ok=True)
+      continue
+    full_path = _resolve_repo_path(rel_path)
+    with full_path.open("w", encoding="utf-8") as f:
       f.write(range_and_content)
 
   # Run the Python program
@@ -166,6 +191,9 @@ def run_function():
     )
     return result, 200
 
+  except ValueError as e:
+    logger.error("Invalid request: %s", e)
+    return jsonify({"status": "failed", "error": str(e)}), 400
   except common_tools.FunctionExecutionError as e:
     logger.error("Function execution failed: %s", e)
     return jsonify({"status": "failed", "error": str(e)}), 400
@@ -247,7 +275,7 @@ def get_changed_files():
 
 
 def execute_shell_command(
-  cmd: str, cwd: str, code_files: dict[str, str], timeout: float,
+  cmd: str, cwd: str, code_files: dict[str, Optional[str]], timeout: float,
 ) -> "tuple[str, dict[str, Optional[str]]]":
   """Execute a shell command.
 
@@ -258,9 +286,11 @@ def execute_shell_command(
   subprocess.run(["rsync", "-a", "--delete", BACKUP_DIR, REPO_DIR])
 
   for rel_path, content in code_files.items():
-    full_path = (Path(REPO_DIR) / rel_path).resolve()
-    if not full_path.is_relative_to(Path(REPO_DIR).resolve()):
-      raise ValueError(f"Path escapes repo directory: {rel_path}")
+    if content is None:
+      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
+      full_path.unlink(missing_ok=True)
+      continue
+    full_path = _resolve_repo_path(rel_path)
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
 
@@ -352,6 +382,9 @@ def run_shell():
 
     return jsonify({"status": "success", "result": {"output": output, "files": files}}), 200
 
+  except ValueError as e:
+    logger.error("Invalid request: %s", e)
+    return jsonify({"status": "failed", "error": str(e)}), 400
   except Exception as e:
     logger.error("Agent execution failed: %s", e)
     return jsonify({"status": "failed", "error": str(e)}), 500
