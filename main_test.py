@@ -339,3 +339,91 @@ class TestGetToken:
     assert call["data"] == {"grant_type": "client_credentials"}
     assert call["auth"].login == "daemon-client"
     assert call["auth"].password == "secret"
+
+
+class TestBuildCoordinatorBaseUrl:
+  """
+  Tests for the `build_coordinator_base_url` function.
+  """
+
+  @pytest.mark.parametrize(
+    "gateway_url,experiment_id,expected",
+    [
+      pytest.param(
+        "https://gw.example.com",
+        "exp-123",
+        "https://gw.example.com/coordinator/exp-123",
+        id="Simple experiment id",
+      ),
+      pytest.param(
+        "https://gw.example.com/",
+        "exp-123",
+        "https://gw.example.com/coordinator/exp-123",
+        id="Trailing slash on gateway url is trimmed",
+      ),
+    ],
+  )
+  def test_builds_experiment_scoped_url(
+    self, gateway_url, experiment_id, expected
+  ):
+    """
+    The base URL nests the experiment id under /coordinator on the gateway.
+    """
+    # given a gateway url and experiment id
+    # when the base url is built
+    result = main.build_coordinator_base_url(gateway_url, experiment_id)
+
+    # then it is the experiment-scoped coordinator path
+    assert result == expected
+
+  @pytest.mark.parametrize(
+    "experiment_id",
+    [
+      pytest.param("", id="Empty"),
+      pytest.param("Exp_123", id="Uppercase and underscore"),
+      pytest.param("exp/../other", id="Path traversal"),
+      pytest.param("-leading-hyphen", id="Leading hyphen"),
+    ],
+  )
+  def test_rejects_invalid_experiment_id(self, experiment_id):
+    """
+    An experiment id that is not a valid DNS label is rejected.
+    """
+    # given an invalid experiment id
+    # when the base url is built, then it raises
+    with pytest.raises(RuntimeError, match="Invalid EXPERIMENT_ID"):
+      main.build_coordinator_base_url("https://gw", experiment_id)
+
+  def test_composed_subscribe_and_response_urls(self):
+    """
+    subscribe_loop and handle_command target the experiment-scoped daemon
+    endpoints when given the built base URL.
+    """
+    # given the experiment-scoped base url and a one-command stream
+    base = main.build_coordinator_base_url("https://gw", "exp-9")
+    command = {"type": "command", "request_id": "r1", "router": "run_code", "payload": {}}
+    lines = [f"data: {json.dumps(command)}\n".encode("utf-8")]
+
+    async def fake_runner(payload):
+      return {"status": "success"}
+
+    session = _FakeSession(
+      post_responses=[_FakeResponse(status=200)],
+      get_response=_FakeResponse(status=200, lines=lines),
+    )
+    token_provider = _FakeTokenProvider(tokens=["tok", "tok"])
+
+    # when the subscribe loop runs
+    asyncio.run(
+      main.subscribe_loop(session, base, token_provider, {"run_code": fake_runner})
+    )
+
+    # then subscribe and response both hit the experiment-scoped path
+    assert (
+      session.get_calls[0]["url"]
+      == "https://gw/coordinator/exp-9/daemon/subscribe"
+    )
+    assert (
+      session.post_calls[0]["url"]
+      == "https://gw/coordinator/exp-9/daemon/response"
+    )

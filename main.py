@@ -10,6 +10,12 @@ Authentication uses a Keycloak client-credentials token (client id / secret from
 env vars). Tyk validates the token and injects identity headers, so the daemon
 only needs to present a Bearer token.
 
+A daemon connects to a single experiment. ``COORDINATOR__URL`` is the gateway
+base URL and ``EXPERIMENT_ID`` names the experiment; the daemon addresses
+``{COORDINATOR__URL}/coordinator/{EXPERIMENT_ID}/daemon/...`` and the gateway
+derives the experiment's namespace from the daemon's own token, so a daemon can
+only ever reach a coordinator inside its own organization.
+
 The blocking executor functions (``execute_python_function``,
 ``execute_shell_command`` and the git-tracking helpers) are unchanged from the
 inbound-serving design; they run in worker threads so the asyncio event loop
@@ -24,6 +30,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import threading
@@ -519,9 +526,29 @@ def _require_env(name: str) -> str:
   return value
 
 
+# An experiment id becomes part of the gateway path and, on the coordinator
+# side, a Kubernetes Service name, so it must be a valid RFC1123 DNS label.
+_EXPERIMENT_ID_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+
+def build_coordinator_base_url(gateway_url: str, experiment_id: str) -> str:
+  """Returns the per-experiment coordinator base URL the daemon connects to.
+
+  The daemon specifies only the experiment id; the gateway derives the
+  namespace from the daemon's own token and routes to that experiment's
+  coordinator. The returned base has ``/daemon/subscribe`` and
+  ``/daemon/response`` appended by the callers.
+  """
+  if not _EXPERIMENT_ID_RE.match(experiment_id):
+    raise RuntimeError(f"Invalid EXPERIMENT_ID: {experiment_id!r}")
+  return f"{gateway_url.rstrip('/')}/coordinator/{experiment_id}"
+
+
 async def main_async() -> None:
   """Builds the client and runs the reconnecting subscribe loop forever."""
-  coordinator_url = _require_env("COORDINATOR__URL").rstrip("/")
+  gateway_url = _require_env("COORDINATOR__URL")
+  experiment_id = _require_env("EXPERIMENT_ID")
+  coordinator_url = build_coordinator_base_url(gateway_url, experiment_id)
   keycloak_url = _require_env("KEYCLOAK_URL").rstrip("/")
   realm = _require_env("KEYCLOAK_REALM")
   client_id = _require_env("DAEMON_CLIENT_ID")
