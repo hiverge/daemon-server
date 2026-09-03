@@ -13,6 +13,9 @@ dependencies = [
   "python-json-logger>=2.0.4"
 ]
 
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
 [tool.ruff]
 # Match the repo's existing 2-space indentation.
 indent-width = 2

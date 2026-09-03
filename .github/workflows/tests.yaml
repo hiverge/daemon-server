@@ -1,0 +1,34 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Match the exact interpreter the release binary is built against.
+          python-version: "3.12.8"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        # `--no-install-project` reads the dependencies without building the
+        # project, which flat-layout repositories like this one cannot do.
+        run: uv sync --no-install-project
+
+      - name: Run tests
+        # `python -m` so the repository root is on `sys.path` and the suite can
+        # import the server modules it tests.
+        run: uv run --no-sync python -m pytest -v
