@@ -66,6 +66,7 @@ class TestEvaluationArguments:
     # `sys.argv`, and rsync only exists in the sandbox image, not on every dev
     # machine. `run_command` uses `Popen`, so the evaluation itself still runs.
     monkeypatch.setattr(main.subprocess, "run", lambda *a, **k: None)
+    self.repo = repo
 
   def _argv_for(self, args: list) -> list[str]:
     """
@@ -126,6 +127,102 @@ class TestEvaluationArguments:
     # then the script read the file the request delivered.
     assert json.loads(output)["result"]["data"] == '["a", "b"]'
 
+  def test_deletes_tombstoned_files_before_running(self) -> None:
+    """A null code-file value removes that path from the restored repo."""
+    (self.repo / "obsolete.txt").write_text("baseline")
+    script = (
+      "import json, pathlib\n"
+      'print(json.dumps({"status": "success", "result": '
+      '{"deleted": not pathlib.Path("obsolete.txt").exists()}}))\n'
+    )
+
+    output = main.execute_python_function(
+      {"check_deleted.py": script, "obsolete.txt": None},
+      [],
+      30,
+      "check_deleted.py",
+    )
+
+    assert json.loads(output)["result"]["deleted"] is True
+
+  def test_deleting_final_symlink_preserves_its_target(self) -> None:
+    """A tombstone removes the named symlink rather than its target."""
+    target = self.repo / "real.py"
+    target.write_text("target")
+    symlink = self.repo / "alias.py"
+    symlink.symlink_to(target.name)
+
+    main.execute_python_function(
+      {"echo_argv.py": self._ECHO_ARGV, "alias.py": None},
+      [],
+      30,
+      "echo_argv.py",
+    )
+
+    assert not symlink.is_symlink()
+    assert target.read_text() == "target"
+
+  @pytest.mark.parametrize("content", [None, "replacement"])
+  def test_rejects_code_file_paths_outside_repo(
+    self, content: str | None
+  ) -> None:
+    """Overlay writes and deletions cannot escape through parent traversal."""
+    outside = self.repo.parent / "outside.txt"
+    outside.write_text("keep me")
+
+    with pytest.raises(ValueError, match="Path escapes repo directory"):
+      main.execute_python_function(
+        {"../outside.txt": content}, [], 30, "unused.py"
+      )
+
+    assert outside.read_text() == "keep me"
+
+  def test_rejects_code_file_paths_through_external_symlink(
+    self,
+  ) -> None:
+    """An in-repo symlinked parent cannot redirect a deletion outside."""
+    outside_dir = self.repo.parent / "outside"
+    outside_dir.mkdir()
+    outside = outside_dir / "outside.txt"
+    outside.write_text("keep me")
+    (self.repo / "escape").symlink_to(outside_dir, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="Path escapes repo directory"):
+      main.execute_python_function(
+        {"escape/outside.txt": None}, [], 30, "unused.py"
+      )
+
+    assert outside.read_text() == "keep me"
+
+  @pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+      (
+        "/run_code",
+        {"code": {"../outside.txt": None}, "timeout": 30},
+      ),
+      (
+        "/shell",
+        {
+          "cmd": "true",
+          "cwd": ".",
+          "code_files": {"../outside.txt": None},
+        },
+      ),
+    ],
+  )
+  def test_path_escape_returns_structured_client_error(
+    self, route: str, payload: dict
+  ) -> None:
+    """Both endpoints return validation failures as JSON 400 responses."""
+    response = main.app.test_client().post(route, json=payload)
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+      "status": "failed",
+      "error": "Path escapes repo directory: ../outside.txt",
+    }
+
 
 class TestShellCommandDescendants:
   """
@@ -154,6 +251,7 @@ class TestShellCommandDescendants:
     # Process-wide, so it outlives a single test.
     common_tools._contaminated.clear()
     self.repo = repo
+    self.backup = backup
     return repo
 
   def _run(self, cmd: str, timeout: float = 30) -> str:
@@ -162,6 +260,47 @@ class TestShellCommandDescendants:
     """
     output, _ = main.execute_shell_command(cmd, str(self.repo), {}, timeout)
     return output
+
+  def test_deletes_tombstoned_files_before_running(self) -> None:
+    """A null code-file value removes that path from the restored repo."""
+    (self.backup / "obsolete.txt").write_text("baseline")
+
+    output, _ = main.execute_shell_command(
+      "test ! -e obsolete.txt && echo deleted",
+      str(self.repo),
+      {"obsolete.txt": None},
+      30,
+    )
+
+    assert output.strip() == "deleted"
+
+  def test_deleting_final_symlink_preserves_its_target(self) -> None:
+    """Shell overlays also unlink the named symlink, not its target."""
+    target = self.backup / "real.py"
+    target.write_text("target")
+    (self.backup / "alias.py").symlink_to(target.name)
+
+    main.execute_shell_command(
+      "true",
+      str(self.repo),
+      {"alias.py": None},
+      30,
+    )
+
+    assert not (self.repo / "alias.py").is_symlink()
+    assert (self.repo / "real.py").read_text() == "target"
+
+  def test_rejects_tombstoned_file_outside_repo(self) -> None:
+    """Shell overlays use the same repository containment check."""
+    outside = self.repo.parent / "outside.txt"
+    outside.write_text("keep me")
+
+    with pytest.raises(ValueError, match="Path escapes repo directory"):
+      main.execute_shell_command(
+        "true", str(self.repo), {"../outside.txt": None}, 30
+      )
+
+    assert outside.read_text() == "keep me"
 
   def test_returns_when_the_command_exits_not_when_its_background_job_does(
     self,
