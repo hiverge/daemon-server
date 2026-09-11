@@ -4,7 +4,7 @@ a = Analysis(
     ['main.py', 'common_tools.py'],
     pathex=['.'],
     binaries=[],
-    datas=[],
+    datas=[('run_multi_evaluator.py', '.')],
     hiddenimports=['common_tools'],
     hookspath=[],
     hooksconfig={},
