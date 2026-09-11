@@ -2,12 +2,6 @@
 """Run a multi-evaluator by hand, mirroring the coordinator's contract.
 
     run_multi_evaluator.py HIVE_YAML
-
-Reads repo.{evaluation_script,evaluation_arguments,aggregation_script} from
-HIVE_YAML, runs each sub-evaluation in sequence, then feeds their results to the
-aggregator. Script paths are resolved relative to the current directory, the
-repo root: the evaluator and aggregator are only meaningful there. Run it from
-the repo root (in a hive shell that is $REPO_DIR, /app).
 """
 
 import json
