@@ -6,7 +6,9 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import stat
 import subprocess
+import sys
 import threading
 from functools import wraps
 from pathlib import Path
@@ -19,6 +21,12 @@ from pythonjsonlogger import json as json_logger
 REPO_DIR = os.environ.get("REPO_DIR", "/app/")  # Directory where the repository is mounted
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/shared/repo/")  # Backup directory to restore original state
 TRACKING_GIT_DIR = os.environ.get("TRACKING_GIT_DIR", "/tmp/.agent_git")  # Git directory for tracking changes without affecting the actual repo
+# Where bundled helper scripts are exposed inside the sandbox/shell
+SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/hiverge/scripts")
+
+# Helper scripts bundled into the freeze (see daemon-server.spec `datas`) and
+# copied into SCRIPTS_DIR on startup so they are on hand in an interactive shell.
+BUNDLED_SCRIPTS = ("run_multi_evaluator.py",)
 
 app = Flask(__name__)
 sandbox_lock = threading.Lock()
@@ -390,10 +398,29 @@ def run_shell():
     return jsonify({"status": "failed", "error": str(e)}), 500
 
 
+def _bundle_dir() -> Path:
+  """Directory holding the bundled data files."""
+  return Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+
+
+def materialize_shell_scripts() -> None:
+  """Copy bundled helper scripts into SCRIPTS_DIR, made executable."""
+  try:
+    os.makedirs(SCRIPTS_DIR, exist_ok=True)
+    for name in BUNDLED_SCRIPTS:
+      dst = Path(SCRIPTS_DIR) / name
+      shutil.copyfile(_bundle_dir() / name, dst)
+      dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    logger.info("Materialized helper scripts into %s", SCRIPTS_DIR)
+  except OSError as e:
+    logger.warning("Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e)
+
+
 if __name__ == "__main__":
   # Ensure required directories exist
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
+  materialize_shell_scripts()
 
   port = int(os.environ.get("PORT", "8080"))
 
