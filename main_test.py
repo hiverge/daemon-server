@@ -496,10 +496,11 @@ class TestShellChangeTracking:
     failing the call.
     """
     # given an empty baseline.
-    # when the command writes invalid UTF-8 alongside a text file.
-    files = self._changed(
-      r"printf '\xff\xfe\x00binary' > blob.bin; echo real > kept.txt"
+    write_blob = (
+      f'{sys.executable} -c '
+      '\'open("blob.bin", "wb").write(b"\\xff\\xfe\\x00binary")\''
     )
+    files = self._changed(f"{write_blob}; echo real > kept.txt")
 
     # then the text file comes back and the binary is left out.
     assert files == {"kept.txt": "real\n"}
