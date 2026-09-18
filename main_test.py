@@ -416,3 +416,109 @@ class TestShellCommandDescendants:
 
     # then a restart was scheduled at the grace delay.
     assert restarts == [main._RESTART_GRACE]
+
+
+class TestShellChangeTracking:
+  """
+  Tests the tracking repo that reports what a shell command changed.
+
+  The repo lives for the pod, not for the call: re-creating it would force
+  `git add -A` to re-hash the whole work tree. These tests pin the behaviour the
+  surviving index has to keep -- the baseline is the restored work tree, not
+  whatever the previous call left behind.
+  """
+
+  @pytest.fixture(autouse=True)
+  def _sandbox(
+    self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+  ) -> pathlib.Path:
+    """
+    Point the server at throwaway directories and shorten the reader deadline.
+    """
+    repo = tmp_path / "repo"
+    backup = tmp_path / "backup"
+    repo.mkdir()
+    backup.mkdir()
+    monkeypatch.setattr(main, "REPO_DIR", f"{repo}/")
+    monkeypatch.setattr(main, "BACKUP_DIR", f"{backup}/")
+    monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
+    monkeypatch.setattr(common_tools, "READER_JOIN_TIMEOUT", 1.0)
+    common_tools._contaminated.clear()
+    self.repo = repo
+    self.backup = backup
+    self.tracking = tmp_path / ".agent_git"
+    return repo
+
+  def _changed(self, cmd: str) -> dict:
+    """
+    Run `cmd` in the sandbox repo and return only what it changed.
+    """
+    _, files = main.execute_shell_command(cmd, str(self.repo), {}, 30)
+    return files
+
+  def test_modified_files_are_reported_with_their_new_content(self) -> None:
+    """An edit to a baseline file comes back carrying the post-command text."""
+    # given a baseline file, and a second one the command leaves alone.
+    (self.backup / "edit.txt").write_text("before")
+    (self.backup / "kept.txt").write_text("untouched")
+
+    # when the command overwrites only the first.
+    files = self._changed("echo after > edit.txt")
+
+    # then the edit is reported and the untouched file is not.
+    assert files == {"edit.txt": "after\n"}
+
+  def test_created_files_are_reported(self) -> None:
+    """A file the command creates is reported, nested paths included."""
+    # given an empty baseline.
+    # when the command writes a new file at the root and one in a new directory.
+    files = self._changed(
+      "echo fresh > new.txt; mkdir -p out && echo built > out/artifact.log"
+    )
+
+    # then both are reported under their repo-relative paths.
+    assert files == {"new.txt": "fresh\n", "out/artifact.log": "built\n"}
+
+  def test_deleted_files_are_reported_as_none(self) -> None:
+    """A deletion is signalled by a None content rather than by omission."""
+    # given a baseline file the command will remove.
+    (self.backup / "remove.txt").write_text("doomed")
+
+    # when the command deletes it.
+    files = self._changed("rm remove.txt")
+
+    # then it is reported with no content.
+    assert files == {"remove.txt": None}
+
+  def test_binary_files_are_not_reported(self) -> None:
+    """
+    Undecodable content has no text to return, so it is omitted rather than
+    failing the call.
+    """
+    # given an empty baseline.
+    # when the command writes invalid UTF-8 alongside a text file.
+    files = self._changed(
+      r"printf '\xff\xfe\x00binary' > blob.bin; echo real > kept.txt"
+    )
+
+    # then the text file comes back and the binary is left out.
+    assert files == {"kept.txt": "real\n"}
+
+  def test_changes_do_not_persist_into_the_next_call(self) -> None:
+    """
+    The surviving index tracks the restored work tree, so a call is never charged
+    for what the previous call did.
+    """
+    # given a first call that edits one baseline file and deletes another.
+    (self.backup / "edit.txt").write_text("before")
+    (self.backup / "remove.txt").write_text("doomed")
+    assert self._changed("echo after > edit.txt; rm remove.txt")
+
+    # when a second call changes nothing, and a third changes one file.
+    quiet = self._changed("true")
+    single = self._changed("echo third > edit.txt")
+
+    # then the previous call's work has been forgotten, and the new edit is seen
+    # against the restored content rather than against the stale index entry.
+    assert quiet == {}
+    assert single == {"edit.txt": "third\n"}
