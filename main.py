@@ -236,7 +236,7 @@ def init_git_tracking():
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
       error_msg = result.stderr.strip() or result.stdout.strip()
-      raise RuntimeError("Failed to initialize git repository: %s", error_msg)
+      raise RuntimeError(f"Failed to initialize git repository: {error_msg}")
 
 
 def snapshot_work_tree():
@@ -247,7 +247,7 @@ def snapshot_work_tree():
   result = subprocess.run(_git(["add", "-A"]), capture_output=True, text=True)
   if result.returncode != 0:
     error_msg = result.stderr.strip() or result.stdout.strip()
-    raise RuntimeError("Failed to stage changes: %s", error_msg)
+    raise RuntimeError(f"Failed to stage changes: {error_msg}")
 
 
 def get_changed_files():
@@ -408,6 +408,7 @@ if __name__ == "__main__":
   # Ensure required directories exist
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
+  init_git_tracking()
   materialize_shell_scripts()
 
   port = int(os.environ.get("PORT", "8080"))
