@@ -408,7 +408,6 @@ if __name__ == "__main__":
   # Ensure required directories exist
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
-  init_git_tracking()
   materialize_shell_scripts()
 
   port = int(os.environ.get("PORT", "8080"))
