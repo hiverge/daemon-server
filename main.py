@@ -224,61 +224,49 @@ def _git(args: list[str]) -> list[str]:
 
 def init_git_tracking():
   """Initialize an external git tracking repo to capture workspace changes."""
-  tracking = Path(TRACKING_GIT_DIR)
-  if tracking.exists():
-    shutil.rmtree(tracking)
+  shutil.rmtree(TRACKING_GIT_DIR, ignore_errors=True)
 
   commands = [
     _git(["init"]),
     _git(["config", "user.email", "agent@docker"]),
     _git(["config", "user.name", "Agent"]),
-    _git(["add", "-A"]),
-    _git(["commit", "-m", "Initial state before agent run", "--allow-empty"]),
   ]
 
   for command in commands:
-    result = subprocess.run(
-      command,
-      capture_output=True,
-      text=True,
-    )
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-      raise RuntimeError(
-        f"Failed to initialize git tracking with command {command}: "
-        f"{result.stderr.strip() or result.stdout.strip()}"
-      )
+      error_msg = result.stderr.strip() or result.stdout.strip()
+      raise RuntimeError(f"Failed to initialize git repository: {error_msg}")
+
+
+def snapshot_work_tree():
+  """Stage the pre-command state of the work tree in the tracking repo."""
+  if not (Path(TRACKING_GIT_DIR) / "HEAD").exists():
+    init_git_tracking()
+
+  result = subprocess.run(_git(["add", "-A"]), capture_output=True, text=True)
+  if result.returncode != 0:
+    error_msg = result.stderr.strip() or result.stdout.strip()
+    raise RuntimeError(f"Failed to stage changes: {error_msg}")
 
 
 def get_changed_files():
   """Return a dict of {relative_path: content} for all files changed since init."""
-  EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf899d15363d7d95d"
-  initial_commit = subprocess.run(
-    _git(["rev-list", "--max-parents=0", "HEAD"]),
-    capture_output=True,
-    text=True,
-  )
-  if initial_commit.returncode != 0 or not initial_commit.stdout.strip():
-    initial_sha = EMPTY_TREE_SHA
-  else:
-    initial_sha = initial_commit.stdout.strip().split('\n')[0]
-
-  subprocess.run(_git(["add", "-A"]), capture_output=True)
+  # This git command returns all untracked files and files with unstaged changes
+  args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
   result = subprocess.run(
-    _git(["diff", "--staged", "--name-only", initial_sha]),
-    capture_output=True,
-    text=True,
+    _git(args), capture_output=True, text=True, cwd=REPO_DIR
   )
+  filenames = [name for name in result.stdout.split("\0") if name]
+
   files = {}
-  for name in result.stdout.strip().splitlines():
-    path = os.path.join(REPO_DIR, name)
-    if os.path.exists(path):
-      try:
-        with open(path, "r", encoding="utf-8") as f:
-          files[name] = f.read()
-      except (UnicodeDecodeError, ValueError):
-        pass
-    else:
-      files[name] = None
+  for fn in filenames:
+    try:
+      files[fn] = (Path(REPO_DIR) / fn).read_text(encoding="utf-8")
+    except FileNotFoundError:
+      files[fn] = None  # deleted by the command
+    except (UnicodeDecodeError, ValueError):
+      pass  # binary content isn't representable in the JSON response
   return files
 
 
@@ -302,7 +290,7 @@ def execute_shell_command(
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
 
-  init_git_tracking()
+  snapshot_work_tree()
 
   # Run the shell command in its own process group, and time out on its own exit
   # rather than on its output reaching end-of-stream. A backgrounded job (`cmd &`)
