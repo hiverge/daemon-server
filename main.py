@@ -254,9 +254,7 @@ def get_changed_files():
   """Return a dict of {relative_path: content} for all files changed since init."""
   # This git command returns all untracked files and files with unstaged changes
   args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
-  result = subprocess.run(
-    _git(args), capture_output=True, text=True, cwd=REPO_DIR
-  )
+  result = subprocess.run(_git(args), capture_output=True, text=True)
   filenames = [name for name in result.stdout.split("\0") if name]
 
   files = {}
