@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import common_tools
+import scratch
 from flask import Flask, jsonify, request
 from pythonjsonlogger import json as json_logger
 
@@ -121,6 +122,8 @@ def execute_python_function(
   evaluation_script: str,
 ) -> str:
   """Execute a Python function in a temporary directory."""
+  # Official evaluation must never depend on a prior session's working files.
+  scratch.clear()
   # Restore the original repository state using rsync
   subprocess.run(["rsync", "-a", "--delete", BACKUP_DIR, REPO_DIR])
 
@@ -362,19 +365,39 @@ def run_shell():
       return jsonify({"status": "failed", "error": message}), 400
 
     cmd = data["cmd"]
-    cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
-    if not cwd.is_relative_to(Path(REPO_DIR).resolve()):
-      return jsonify(
-        {"status": "failed", "error": "cwd escapes repo directory"}
-      ), 400
     code_files = data["code_files"]
     timeout = float(data.get("timeout", 120))
 
     logger.info("Executing shell command with timeout=%s", timeout)
 
-    output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
+    scratch_files = data.get("scratch_files", {})
+    with scratch.restored(scratch_files):
+      cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
+      if not (
+        cwd.is_relative_to(Path(REPO_DIR).resolve())
+        or cwd.is_relative_to(scratch.SCRATCH_DIR)
+      ):
+        return jsonify(
+          {"status": "failed", "error": "cwd must be inside the repo or /scratch"}
+        ), 400
+      output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
+      result = {"output": output, "files": files}
+      try:
+        result["scratch_changes"] = scratch.changes(scratch_files)
+      except (scratch.ScratchError, OSError) as error:
+        # Return the command output and candidate changes even if scratch
+        # cannot be saved. Never pretend an incomplete snapshot was persisted.
+        result["scratch_changes"] = None
+        reason = (
+          str(error) if isinstance(error, scratch.ScratchError)
+          else "Scratch files could not be read."
+        )
+        result["scratch_error"] = (
+          f"{reason} The previous saved scratch state has been retained; "
+          "this command's scratch changes were discarded."
+        )
 
-    return jsonify({"status": "success", "result": {"output": output, "files": files}}), 200
+    return jsonify({"status": "success", "result": result}), 200
 
   except ValueError as e:
     logger.error("Invalid request: %s", e)
