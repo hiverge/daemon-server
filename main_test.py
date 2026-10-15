@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import pathlib
+import shlex
 import signal
 import sys
 import time
@@ -11,8 +12,20 @@ import time
 import pytest
 
 import common_tools
+import filesystem_cleanup
 import main
 from conftest import wait_until_dead
+
+
+@pytest.fixture(autouse=True)
+def _isolated_filesystem(
+  monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+):
+  """Never inventory or clean the development machine's real filesystem."""
+  monkeypatch.setattr(main, "FILESYSTEM_ROOT", tmp_path)
+  common_tools._contaminated.clear()
+  yield
+  common_tools._contaminated.clear()
 
 
 class _Response:
@@ -347,7 +360,7 @@ class TestShellCommandDescendants:
     """
     # given a command that backgrounds a 30 second job and then hangs itself. The
     # pid goes to a file, as a timed-out command reports only the timeout.
-    pid_file = tmp_path / "job.pid"
+    pid_file = self.repo / "job.pid"
     cmd = f"sleep 30 & echo $! > {pid_file}; sleep 30"
 
     # when it is run with a short timeout.
@@ -371,7 +384,7 @@ class TestShellCommandDescendants:
     # kill and keeps holding the inherited pipes for longer than any deadline in
     # play. The pid goes to a file so this test can clean up what the code under
     # test cannot.
-    pid_file = tmp_path / "escaper.pid"
+    pid_file = self.repo / "escaper.pid"
     cmd = (
       f"{sys.executable} -c "
       "'import subprocess, sys, os; "
@@ -523,3 +536,250 @@ class TestShellChangeTracking:
     # against the restored content rather than against the stale index entry.
     assert quiet == {}
     assert single == {"edit.txt": "third\n"}
+
+
+class TestExternalCleanup:
+  """Exercise external cleanup through real shell and evaluation requests."""
+
+  @pytest.fixture(autouse=True)
+  def _sandbox(
+    self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+  ) -> None:
+    self.root = tmp_path
+    self.repo = tmp_path / "app"
+    self.backup = tmp_path / "shared" / "repo"
+    self.repo.mkdir()
+    self.backup.mkdir(parents=True)
+    monkeypatch.setattr(main, "REPO_DIR", f"{self.repo}/")
+    monkeypatch.setattr(main, "BACKUP_DIR", f"{self.backup}/")
+    monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
+    monkeypatch.setenv("PYTHON_EXECUTABLE", sys.executable)
+
+  def _shell(self, cmd: str, timeout: float = 30):
+    return main.app.test_client().post(
+      "/shell",
+      json={"cmd": cmd, "cwd": ".", "code_files": {}, "timeout": timeout},
+    )
+
+  def _evaluate(self, script: str, timeout: float = 30):
+    return main.app.test_client().post(
+      "/run_code",
+      json={
+        "code": {"evaluator.py": script},
+        "timeout": timeout,
+        "args": [],
+      },
+    )
+
+  @pytest.mark.parametrize(
+    ("ending", "timeout", "status", "output"),
+    [
+      ("print('result')", 30, 200, "result"),
+      ("raise SystemExit(7)", 30, 400, "non-zero exit code (7)"),
+      ("time.sleep(30)", 1, 400, "Evaluation timed-out after 1.0 seconds."),
+    ],
+  )
+  def test_evaluation_cleans_up_after_success_failure_and_timeout(
+    self, ending: str, timeout: float, status: int, output: str,
+  ) -> None:
+    """Evaluator artifacts are removed while setup data and repo files survive."""
+    outside = self.root / "scratch"
+    outside.mkdir()
+    (outside / "existing.txt").write_text("setup data")
+    response = self._evaluate(
+      "from pathlib import Path\n"
+      "import time\n"
+      f"outside = Path({str(outside)!r})\n"
+      "(outside / 'new-directory').mkdir()\n"
+      "(outside / 'new-directory' / 'data').write_text('scratch')\n"
+      "Path('result.txt').write_text('candidate')\n"
+      f"{ending}\n",
+      timeout,
+    )
+
+    assert response.status_code == status
+    assert output in response.get_data(as_text=True)
+    assert not (outside / "new-directory").exists()
+    assert (outside / "existing.txt").read_text() == "setup data"
+    assert (self.repo / "result.txt").read_text() == "candidate"
+
+  def test_checkpoint_is_read_before_external_cleanup(self) -> None:
+    """A checkpoint pointing at a new external file can be read before removal."""
+    outside = self.root / "checkpoint.json"
+    script = (
+      "from pathlib import Path\n"
+      f"checkpoint = Path({str(outside)!r})\n"
+      "checkpoint.write_text('{\"score\": 1}')\n"
+      "Path('checkpoint.json').symlink_to(checkpoint)\n"
+      "raise SystemExit(7)\n"
+    )
+
+    with main.app.app_context():
+      response, status = main.execute_python_function(
+        {"evaluator.py": script}, [], 30, "evaluator.py",
+      )
+
+    assert status == 200
+    assert response.get_json()["data"] == {
+      "output": '{"score": 1}', "metainfo": "Checkpoint",
+    }
+    assert not outside.exists()
+
+  @pytest.mark.parametrize(
+    ("ending", "timeout", "expected_output"),
+    [
+      ("echo done", 30, "done"),
+      ("exit 7", 30, "Exit code: 7"),
+      ("sleep 30", 1, "Error: command timed out after 1.0s"),
+    ],
+  )
+  def test_removes_new_paths_after_success_failure_and_timeout(
+    self, ending: str, timeout: float, expected_output: str,
+  ) -> None:
+    """External artifacts vanish before the response; repo edits are returned."""
+    locations = [
+      self.root / "tmp",
+      self.root / "home" / "worker" / ".cache",
+      self.root / "opt",
+      self.root / "shared",
+      self.root / "dev" / "shm",
+    ]
+    for location in locations:
+      location.mkdir(parents=True, exist_ok=True)
+      (location / "existing.txt").write_text("setup data")
+    new_tree = self.root / "new tree"
+    quoted_locations = " ".join(shlex.quote(str(path)) for path in locations)
+    response = self._shell(
+      f"for directory in {quoted_locations}; do "
+      'echo scratch > "$directory/new.txt"; '
+      'mkdir -p "$directory/new-directory/nested"; '
+      'echo nested > "$directory/new-directory/nested/data"; '
+      "done; "
+      f"mkdir -p {shlex.quote(str(new_tree))}; "
+      "echo candidate > candidate.txt; "
+      f"{ending}",
+      timeout,
+    )
+
+    assert response.status_code == 200
+    result = response.get_json()["result"]
+    assert expected_output in result["output"]
+    assert result["files"] == {"candidate.txt": "candidate\n"}
+    for location in locations:
+      assert not (location / "new.txt").exists()
+      assert not (location / "new-directory").exists()
+      assert (location / "existing.txt").read_text() == "setup data"
+    assert not new_tree.exists()
+    assert (self.root / ".agent_git" / "HEAD").exists()
+
+  def test_new_symlinks_are_unlinked_without_touching_targets(self) -> None:
+    """Neither dangling links nor directory links are traversed during cleanup."""
+    outside = self.root / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (self.backup / "keep.txt").write_text("candidate")
+    existing_link = self.root / "existing-link"
+    existing_link.symlink_to(outside, target_is_directory=True)
+    existing_dangling = self.root / "existing-dangling"
+    existing_dangling.symlink_to(self.root / "missing")
+    new_link = self.root / "new-link"
+    new_dangling = self.root / "new-dangling"
+    response = self._shell(
+      f"ln -s {shlex.quote(str(self.repo))} {shlex.quote(str(new_link))}; "
+      f"ln -s missing {shlex.quote(str(new_dangling))}"
+    )
+
+    assert response.status_code == 200
+    assert not new_link.is_symlink()
+    assert not new_dangling.is_symlink()
+    assert existing_link.is_symlink()
+    assert existing_dangling.is_symlink()
+    assert (outside / "keep.txt").read_text() == "keep"
+    assert (self.repo / "keep.txt").read_text() == "candidate"
+
+  def test_kernel_paths_are_excluded(self) -> None:
+    """Kernel-managed entries are left alone, while /dev/shm is cleaned."""
+    paths = [self.root / name for name in ("proc", "sys", "dev", "dev/shm")]
+    for path in paths:
+      path.mkdir(parents=True, exist_ok=True)
+    quoted_paths = " ".join(shlex.quote(str(path)) for path in paths)
+
+    response = self._shell(
+      f"for directory in {quoted_paths}; do touch \"$directory/new\"; done"
+    )
+
+    assert response.status_code == 200
+    assert all((path / "new").exists() for path in paths[:-1])
+    assert not (paths[-1] / "new").exists()
+
+  def test_cleans_up_if_collecting_repo_changes_fails(
+    self, monkeypatch: pytest.MonkeyPatch,
+  ) -> None:
+    """An exception after command execution still removes external artifacts."""
+    outside = self.root / "new.txt"
+
+    def fail_collection():
+      raise RuntimeError("Could not collect changes")
+
+    monkeypatch.setattr(main, "get_changed_files", fail_collection)
+    response = self._shell(f"touch {shlex.quote(str(outside))}")
+
+    assert response.status_code == 500
+    assert not outside.exists()
+
+  @pytest.mark.parametrize("route", ["/shell", "/run_code"])
+  def test_cleanup_failure_restarts_and_rejects_further_execution(
+    self, monkeypatch: pytest.MonkeyPatch, route: str,
+  ) -> None:
+    """A failed cleanup cannot be followed by another shell or evaluation."""
+    outside = self.root / "new-directory"
+    original_rmtree = filesystem_cleanup.shutil.rmtree
+
+    def fail_cleanup(path, *args, **kwargs):
+      if pathlib.Path(path) == outside:
+        raise PermissionError("Cannot remove external directory")
+      return original_rmtree(path, *args, **kwargs)
+
+    restarts: list[float] = []
+    monkeypatch.setattr(filesystem_cleanup.shutil, "rmtree", fail_cleanup)
+    monkeypatch.setattr(
+      main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts),
+    )
+    if route == "/shell":
+      response = self._shell(f"mkdir {shlex.quote(str(outside))}")
+    else:
+      response = self._evaluate(
+        f"from pathlib import Path\nPath({str(outside)!r}).mkdir()\nprint('done')"
+      )
+
+    assert response.status_code == 500
+    assert common_tools.is_contaminated()
+    assert restarts == [main._RESTART_GRACE]
+    assert self._shell("echo should-not-run > unexpected.txt").status_code == 503
+    response = main.app.test_client().post(
+      "/run_code", json={"code": {}, "timeout": 30},
+    )
+    assert response.status_code == 503
+    assert not (self.repo / "unexpected.txt").exists()
+
+  def test_incomplete_inventory_does_not_run_command(
+    self, monkeypatch: pytest.MonkeyPatch,
+  ) -> None:
+    """Unreadable directories must not yield an unsafe, partial baseline."""
+    unreadable = self.root / "unreadable"
+    unreadable.mkdir()
+    (unreadable / "existing.txt").write_text("keep")
+    original_scandir = filesystem_cleanup.os.scandir
+
+    def fail_inventory(path):
+      if pathlib.Path(path) == unreadable:
+        raise PermissionError("Cannot inventory directory")
+      return original_scandir(path)
+
+    monkeypatch.setattr(filesystem_cleanup.os, "scandir", fail_inventory)
+    response = self._shell("echo should-not-run > unexpected.txt")
+
+    assert response.status_code == 500
+    assert not (self.repo / "unexpected.txt").exists()
+    assert (unreadable / "existing.txt").read_text() == "keep"
+    assert not common_tools.is_contaminated()

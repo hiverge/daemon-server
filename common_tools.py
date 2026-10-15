@@ -68,19 +68,18 @@ READER_JOIN_TIMEOUT = 5.0
 # uninterruptible syscall can outlast it.
 PROCESS_GROUP_KILL_TIMEOUT = 5.0
 
-# Set when a command leaves a process this daemon could not kill. The survivor
-# competes for CPU, memory and I/O with whatever runs next, so a candidate timed
-# against it is scored on a machine that is not idle.
+# Set when process or filesystem cleanup fails. Leftover processes and files can
+# affect subsequent requests, so the sandbox must stop accepting work.
 _contaminated = threading.Event()
 
 
 def mark_contaminated() -> None:
-  """Record that a process survived this daemon's attempt to kill it."""
+  """Record that sandbox cleanup could not complete."""
   _contaminated.set()
 
 
 def is_contaminated() -> bool:
-  """Whether a command left a process this daemon could not kill."""
+  """Whether incomplete cleanup makes this sandbox unsuitable for more work."""
   return _contaminated.is_set()
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 import common_tools
+from filesystem_cleanup import cleanup_new_external_paths
 from flask import Flask, jsonify, request
 from pythonjsonlogger import json as json_logger
 
@@ -23,6 +24,8 @@ BACKUP_DIR = os.environ.get("BACKUP_DIR", "/shared/repo/")  # Backup directory t
 TRACKING_GIT_DIR = os.environ.get("TRACKING_GIT_DIR", "/tmp/.agent_git")  # Git directory for tracking changes without affecting the actual repo
 # Where bundled helper scripts are exposed inside the sandbox/shell
 SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/hiverge/scripts")
+# Kept explicit so tests can inventory a throwaway filesystem instead of /.
+FILESYSTEM_ROOT = Path("/")
 
 # Helper scripts bundled into the freeze (see daemon-server.spec `datas`) and
 # copied into SCRIPTS_DIR on startup so they are on hand in an interactive shell.
@@ -57,6 +60,10 @@ def lock_sandbox():
         ), 429
 
       try:
+        if common_tools.is_contaminated():
+          return jsonify(
+            {"status": "failed", "error": "Sandbox cleanup failed; restarting."}
+          ), 503
         return f(*args, **kwargs)
       finally:
         sandbox_lock.release()
@@ -70,15 +77,15 @@ _RESTART_GRACE = 1.0
 
 
 def _restart_container() -> None:
-  """Exit so the container restarts, discarding anything left running in it.
+  """Exit so the container restarts after incomplete sandbox cleanup.
 
   The daemon is PID 1 in the sandbox container, so ending it ends the container's
   PID namespace, taking any survivor with it, and the kubelet starts a
   replacement.
   """
   logger.warning(
-    "A process survived this evaluation and is still running on the pod. "
-    "Restarting the container so it cannot affect later measurements."
+    "Sandbox cleanup was incomplete. Restarting the container so it cannot "
+    "affect later measurements."
   )
   # `os._exit` skips interpreter cleanup, which would join the abandoned readers.
   os._exit(1)
@@ -86,7 +93,7 @@ def _restart_container() -> None:
 
 @app.after_request
 def _restart_if_contaminated(response):
-  """Restart the container once a survivor makes its measurements unreliable."""
+  """Restart the container after incomplete process or filesystem cleanup."""
   if common_tools.is_contaminated():
     # After the response: this evaluation ran on a clean pod, only later ones are
     # at risk.
@@ -143,27 +150,28 @@ def execute_python_function(
   # TODO: if people write evaluation_script with a different language extension,
   # we should detect that and choose the right executable (e.g. node for .js)
   python_executable = os.environ.get("PYTHON_EXECUTABLE", "python3")
-  try:
-    output = common_tools.run_command(
-      [python_executable, evaluation_script] + args, REPO_DIR, timeout
-    )
-    return output
-  except common_tools.FunctionExecutionError as e:
-    logger.info(
-      "Run command failed: %s. Attempting to read checkpoint data.", e
-    )
+  with cleanup_new_external_paths(Path(REPO_DIR), root=FILESYSTEM_ROOT):
     try:
-      # If the script leaves checkpointed json data, find and return it
-      output = common_tools.run_command(["cat", "checkpoint.json"], REPO_DIR)
-      return jsonify({"status": "success", "data": {"output": output, "metainfo": "Checkpoint"}}), 200
-    except common_tools.FunctionExecutionError as ee:
-      logger.info(
-        "Failed to read checkpoint data: %s. Returning original error.", ee
+      output = common_tools.run_command(
+        [python_executable, evaluation_script] + args, REPO_DIR, timeout
       )
-      # Re-raise the original error unchanged. `run_command` already produces
-      # the final, user-facing message (including any "Execution failed:"
-      # prefix), so it must not be wrapped again here.
-      raise e
+      return output
+    except common_tools.FunctionExecutionError as e:
+      logger.info(
+        "Run command failed: %s. Attempting to read checkpoint data.", e
+      )
+      try:
+        # If the script leaves checkpointed json data, find and return it
+        output = common_tools.run_command(["cat", "checkpoint.json"], REPO_DIR)
+        return jsonify({"status": "success", "data": {"output": output, "metainfo": "Checkpoint"}}), 200
+      except common_tools.FunctionExecutionError as ee:
+        logger.info(
+          "Failed to read checkpoint data: %s. Returning original error.", ee
+        )
+        # Re-raise the original error unchanged. `run_command` already produces
+        # the final, user-facing message (including any "Execution failed:"
+        # prefix), so it must not be wrapped again here.
+        raise e
 
 
 @app.route("/health", methods=["GET"])
@@ -205,7 +213,7 @@ def run_function():
   except common_tools.FunctionExecutionError as e:
     logger.error("Function execution failed: %s", e)
     return jsonify({"status": "failed", "error": str(e)}), 400
-  except subprocess.SubprocessError as e:
+  except (subprocess.SubprocessError, OSError) as e:
     logger.error("Unexpected error: %s", e)
     if str(e) == "Exception occurred in preexec_fn.":
       return jsonify(
@@ -290,6 +298,14 @@ def execute_shell_command(
 
   snapshot_work_tree()
 
+  with cleanup_new_external_paths(Path(REPO_DIR), root=FILESYSTEM_ROOT):
+    return _run_shell_command(cmd, cwd, timeout)
+
+
+def _run_shell_command(
+  cmd: str, cwd: str, timeout: float,
+) -> tuple[str, dict[str, Optional[str]]]:
+  """Run the command and collect repo changes before external-file cleanup."""
   # Run the shell command in its own process group, and time out on its own exit
   # rather than on its output reaching end-of-stream. A backgrounded job (`cmd &`)
   # inherits the pipes, so timing out on end-of-stream would charge the command
