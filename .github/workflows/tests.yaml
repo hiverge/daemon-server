@@ -26,9 +26,17 @@ jobs:
       - name: Install dependencies
         # `--no-install-project` reads the dependencies without building the
         # project, which flat-layout repositories like this one cannot do.
-        run: uv sync --no-install-project
+        run: uv sync --no-install-project --extra workspace
 
       - name: Run tests
         # `python -m` so the repository root is on `sys.path` and the suite can
         # import the server modules it tests.
         run: uv run --no-sync python -m pytest -v
+
+      - name: Build workspace image
+        run: docker build -f Dockerfile.workspace -t daemon-workspace:test .
+
+      - name: Verify workspace container reuse
+        env:
+          WORKSPACE_TEST_IMAGE: daemon-workspace:test
+        run: uv run --no-sync python -m pytest workspace_container_test.py -v

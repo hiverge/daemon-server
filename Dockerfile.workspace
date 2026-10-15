@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1
+FROM ghcr.io/astral-sh/uv:0.11.28 AS uv
+FROM python:3.12-slim-bookworm AS dependencies
+COPY --from=uv /uv /usr/local/bin/uv
+WORKDIR /opt/daemon
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --extra workspace --no-install-project
+
+FROM python:3.12-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash git rsync ripgrep ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /app /shared/repo
+WORKDIR /opt/daemon
+COPY --from=dependencies /opt/daemon/.venv .venv
+COPY main.py common_tools.py workspace.py run_multi_evaluator.py ./
+ENV DAEMON_MODE=workspace REPO_DIR=/app/ BACKUP_DIR=/shared/repo/ \
+    PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+EXPOSE 8080
+# PID 1 exits on release/failure. Kubernetes creates a fresh container layer.
+ENTRYPOINT ["/opt/daemon/.venv/bin/python", "/opt/daemon/main.py"]

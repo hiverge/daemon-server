@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from functools import wraps
+from importlib import import_module
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ BUNDLED_SCRIPTS = ("run_multi_evaluator.py",)
 
 app = Flask(__name__)
 sandbox_lock = threading.Lock()
+workspace = None
 
 # Configure logging
 log_handler = logging.StreamHandler()
@@ -76,10 +78,13 @@ def _restart_container() -> None:
   PID namespace, taking any survivor with it, and the kubelet starts a
   replacement.
   """
-  logger.warning(
-    "A process survived this evaluation and is still running on the pod. "
-    "Restarting the container so it cannot affect later measurements."
-  )
+  if workspace:
+    logger.info("Replacing the released or failed workspace container.")
+  else:
+    logger.warning(
+      "A process survived this evaluation and is still running on the pod. "
+      "Restarting the container so it cannot affect later measurements."
+    )
   # `os._exit` skips interpreter cleanup, which would join the abandoned readers.
   os._exit(1)
 
@@ -114,6 +119,26 @@ def _resolve_repo_path(
   return full_path
 
 
+def apply_code_files(
+  code_files: dict[str, Optional[str]], *, create_parents: bool = False
+) -> None:
+  """Apply the text overlay shared by evaluation and workspace modes.
+
+  None deletes the named entry; text overwrites its resolved target. Optional
+  parent creation preserves the existing difference between shell and evaluator
+  writes. This helper performs path containment, not session edit-policy checks.
+  """
+  for rel_path, content in code_files.items():
+    if content is None:
+      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
+      full_path.unlink(missing_ok=True)
+      continue
+    full_path = _resolve_repo_path(rel_path)
+    if create_parents:
+      full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(content, encoding="utf-8")
+
+
 def execute_python_function(
   code_files: dict[str, Optional[str]],
   args: list,
@@ -129,14 +154,7 @@ def execute_python_function(
   # the quote characters inside `sys.argv[n]`.
   args = [str(arg) for arg in args]
 
-  for rel_path, range_and_content in code_files.items():
-    if range_and_content is None:
-      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
-      full_path.unlink(missing_ok=True)
-      continue
-    full_path = _resolve_repo_path(rel_path)
-    with full_path.open("w", encoding="utf-8") as f:
-      f.write(range_and_content)
+  apply_code_files(code_files)
 
   # Run the Python program
   # Use system python3 instead of sys.executable to avoid issues with PyInstaller bundles
@@ -169,6 +187,8 @@ def execute_python_function(
 @app.route("/health", methods=["GET"])
 def health_check():
   """Health check endpoint."""
+  if workspace:
+    return jsonify(workspace.health()), 503 if workspace.retired else 200
   return jsonify({"status": "healthy"}), 200
 
 
@@ -176,6 +196,8 @@ def health_check():
 @lock_sandbox()
 def run_function():
   """Run the Python function provided in the request."""
+  if workspace:
+    return jsonify({"status": "failed", "error": "Not an evaluation sandbox"}), 404
   try:
     if not request.is_json:
       logger.error("Request content type is not application/json")
@@ -279,14 +301,7 @@ def execute_shell_command(
   # Restore the original repository state using rsync
   subprocess.run(["rsync", "-a", "--delete", BACKUP_DIR, REPO_DIR])
 
-  for rel_path, content in code_files.items():
-    if content is None:
-      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
-      full_path.unlink(missing_ok=True)
-      continue
-    full_path = _resolve_repo_path(rel_path)
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(content, encoding="utf-8")
+  apply_code_files(code_files, create_parents=True)
 
   snapshot_work_tree()
 
@@ -344,7 +359,12 @@ def execute_shell_command(
 @app.route("/shell", methods=["POST"])
 @lock_sandbox()
 def run_shell():
-  """Run a shell command from a given file state."""
+  """Serve shell commands using the configured mode's execution lifecycle.
+
+  Evaluation mode restores supplied file state and returns command writeback.
+  Workspace mode retains the session's files/terminal and returns no writeback,
+  because its changes already live in the authoritative repository.
+  """
   try:
     if not request.is_json:
       logger.error("Request content type is not application/json")
@@ -354,14 +374,20 @@ def run_shell():
 
     # Get data and validate required fields
     data = request.get_json()
+    required = ("cmd",) if workspace else ("cmd", "cwd", "code_files")
     missing_fields = [
-      field for field in ("cmd", "cwd", "code_files") if field not in data
+      field for field in required if field not in data
     ]
     if missing_fields:
       message = f"Missing required field(s): {', '.join(missing_fields)}"
       return jsonify({"status": "failed", "error": message}), 400
 
     cmd = data["cmd"]
+    if workspace:
+      output = workspace.run_shell(
+        data, request.headers.get("X-Workspace-Session-ID")
+      )
+      return jsonify({"status": "success", "result": {"output": output, "files": {}}}), 200
     cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
     if not cwd.is_relative_to(Path(REPO_DIR).resolve()):
       return jsonify(
@@ -381,7 +407,50 @@ def run_shell():
     return jsonify({"status": "failed", "error": str(e)}), 400
   except Exception as e:
     logger.error("Agent execution failed: %s", e)
+    if workspace and isinstance(e, (PermissionError, RuntimeError)):
+      status = 403 if isinstance(e, PermissionError) else 409
+      return jsonify({"status": "failed", "error": str(e)}), status
     return jsonify({"status": "failed", "error": str(e)}), 500
+
+
+@app.route("/workspace/<operation>", methods=["POST"])
+@lock_sandbox()
+def workspace_operation(operation):
+  """Serve workspace file/lifecycle operations under the shared sandbox lock.
+
+  The runtime owns session state; this boundary supplies the session ID and
+  translates its result or validation/lifecycle errors into HTTP responses.
+  """
+  if not workspace:
+    return jsonify({"status": "failed", "error": "Not a workspace"}), 404
+  try:
+    result = workspace.handle(
+      operation, request.get_json(), request.headers.get("X-Workspace-Session-ID")
+    )
+    return jsonify({"status": "success", "result": result}), 200
+  except (ValueError, KeyError, TypeError, FileNotFoundError, NotADirectoryError) as e:
+    return jsonify({"status": "failed", "error": str(e)}), 400
+  except PermissionError as e:
+    return jsonify({"status": "failed", "error": str(e)}), 403
+  except RuntimeError as e:
+    return jsonify({"status": "failed", "error": str(e)}), 409
+
+
+def configure_workspace():
+  """Select the daemon mode at startup, defaulting to evaluation behavior.
+
+  Workspace mode seeds its repository and loads optional runtime dependencies.
+  The dynamic import keeps them out of the existing evaluation binary.
+  """
+  global workspace
+  mode = os.environ.get("DAEMON_MODE", "evaluation")
+  if mode == "workspace":
+    # Dynamic import intentionally keeps this module and its optional
+    # dependencies out of the existing evaluation-only PyInstaller freeze.
+    Workspace = import_module("workspace").Workspace
+    workspace = Workspace(REPO_DIR, BACKUP_DIR, _resolve_repo_path, apply_code_files)
+  elif mode != "evaluation":
+    raise ValueError(f"Unknown DAEMON_MODE: {mode}")
 
 
 def _bundle_dir() -> Path:
@@ -407,6 +476,7 @@ if __name__ == "__main__":
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
   materialize_shell_scripts()
+  configure_workspace()
 
   port = int(os.environ.get("PORT", "8080"))
 

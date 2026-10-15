@@ -160,3 +160,17 @@ To modify the webserver:
 3. Test locally (see Verification section)
 4. Release: `./build-and-release.sh v1.x.x`
 5. Update operator to use new version
+
+## Workspace Image
+
+`Dockerfile.workspace` builds the workspace image with `DAEMON_MODE=workspace`.
+
+### Build and Test
+
+```bash
+docker build -f Dockerfile.workspace -t daemon-workspace:local .
+uv sync --no-install-project --extra workspace
+uv run --no-sync python -m pytest
+WORKSPACE_TEST_IMAGE=daemon-workspace:local \
+  uv run --no-sync python -m pytest workspace_container_test.py -v
+```
