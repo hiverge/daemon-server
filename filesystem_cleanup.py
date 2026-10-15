@@ -84,7 +84,7 @@ def cleanup_new_external_paths(
           if name in dirs:
             # Do not walk a new directory after removing its entire subtree.
             dirs.remove(name)
-    except OSError:
+    except Exception:
       logger.exception("Could not clean up files created outside the repository")
       common_tools.mark_contaminated()
       raise
