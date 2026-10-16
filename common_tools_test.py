@@ -410,19 +410,19 @@ class TestRunCommandLogging:
   Tests that `run_command` logs an evaluation's output live.
   """
 
-  def test_logs_each_output_line_under_the_user_category(
+  def test_logs_each_output_line_under_the_user_category_when_opted_in(
     self, caplog: pytest.LogCaptureFixture
   ) -> None:
     """
-    An evaluation's stdout is logged line-by-line under the "user" category, so
-    its progress stays visible in the sandbox logs.
+    With `log_output` set, stdout is logged line-by-line under the "user"
+    category, so an evaluation's progress stays visible in the sandbox logs.
     """
     # given a command that prints two lines and exits cleanly.
     cmd = _python("print('first line'); print('final line')")
 
-    # when it is run.
+    # when it is run with logging opted in.
     with caplog.at_level(logging.INFO):
-      common_tools.run_command(cmd)
+      common_tools.run_command(cmd, log_output=True)
 
     # then both lines were logged under the "user" category.
     user_messages = [
@@ -431,6 +431,26 @@ class TestRunCommandLogging:
       if getattr(record, "category", None) == "user"
     ]
     assert user_messages == ["[stdout] first line", "[stdout] final line"]
+
+  def test_does_not_log_output_by_default(
+    self, caplog: pytest.LogCaptureFixture
+  ) -> None:
+    """
+    Output is kept out of the logs unless a caller opts in, so a command reading
+    a source file cannot leak its contents there.
+    """
+    # given a command that prints a line standing in for file contents.
+    cmd = _python("print('secret source line')")
+
+    # when it is run without opting into logging.
+    with caplog.at_level(logging.INFO):
+      result = common_tools.run_command(cmd)
+
+    # then the line is returned to the caller but never logged.
+    assert result == "secret source line"
+    assert not any(
+      "secret source line" in record.getMessage() for record in caplog.records
+    )
 
 
 class TestLastOutputLines:

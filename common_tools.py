@@ -250,12 +250,17 @@ def run_command(
   cmd: str | Sequence[str],
   cwd: str = ".",
   timeout: float = 10.0,
+  log_output: bool = False,
 ) -> str:
   """Run a command with timeout and return the last line of its output.
 
   The command runs in its own process group, and both the wait for it to exit and
   the wait for its output to drain are bounded, so this returns even when the
   command leaves background processes behind.
+
+  When `log_output` is set, each output line is logged under the "user" category.
+  It is off by default so command output cannot leak source code into the sandbox
+  logs; evaluations opt in to keep their progress visible.
   """
 
   # PyInstaller can poison the subprocess environemnt. See below
@@ -283,14 +288,13 @@ def run_command(
     start_new_session=True,
   )
   with sandboxed_process(process):
-    # `read_stream` logs every line live, so only the last
-    # `MAX_ERROR_OUTPUT_LINES` of each stream are retained here: enough for the
-    # error tail and the final stdout line, and bounded no matter how much the
-    # evaluator prints.
+    # Only the last `MAX_ERROR_OUTPUT_LINES` of each stream are retained here:
+    # enough for the error tail and the final stdout line, and bounded no matter
+    # how much the command prints.
     stdout_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
     stderr_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
     readers = start_stream_readers(
-      process, stdout_lines, stderr_lines, log_output=True
+      process, stdout_lines, stderr_lines, log_output=log_output
     )
 
     try:
