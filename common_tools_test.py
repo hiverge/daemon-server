@@ -405,6 +405,34 @@ class TestOrphanedDescendants:
     )
 
 
+class TestRunCommandLogging:
+  """
+  Tests that `run_command` logs an evaluation's output live.
+  """
+
+  def test_logs_each_output_line_under_the_user_category(
+    self, caplog: pytest.LogCaptureFixture
+  ) -> None:
+    """
+    An evaluation's stdout is logged line-by-line under the "user" category, so
+    its progress stays visible in the sandbox logs.
+    """
+    # given a command that prints two lines and exits cleanly.
+    cmd = _python("print('first line'); print('final line')")
+
+    # when it is run.
+    with caplog.at_level(logging.INFO):
+      common_tools.run_command(cmd)
+
+    # then both lines were logged under the "user" category.
+    user_messages = [
+      record.getMessage()
+      for record in caplog.records
+      if getattr(record, "category", None) == "user"
+    ]
+    assert user_messages == ["[stdout] first line", "[stdout] final line"]
+
+
 class TestLastOutputLines:
   """
   Tests for the `last_output_lines` helper.

@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import os
 import pathlib
 import signal
@@ -398,6 +399,26 @@ class TestShellCommandDescendants:
 
     # and it returned on its own deadline, nowhere near the escapee's 30s.
     assert elapsed < 10, f"took {elapsed:.1f}s, so cleanup waited on the escapee"
+
+  def test_does_not_log_the_command_output(
+    self, caplog: pytest.LogCaptureFixture
+  ) -> None:
+    """
+    A shell command's output is kept out of the sandbox logs, so an agent that
+    reads a source file through the tool cannot leak its contents there.
+    """
+    # given a command that prints a line standing in for file contents.
+    cmd = "echo 'secret source line'"
+
+    # when it is run.
+    with caplog.at_level(logging.INFO):
+      output = self._run(cmd)
+
+    # then the output is returned to the caller but never logged.
+    assert output.strip() == "secret source line"
+    assert not any(
+      "secret source line" in record.getMessage() for record in caplog.records
+    )
 
   def test_schedules_a_restart_once_the_pod_is_contaminated(
     self, monkeypatch: pytest.MonkeyPatch

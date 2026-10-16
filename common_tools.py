@@ -18,15 +18,22 @@ logger = logging.getLogger(__name__)
 
 
 def read_stream(
-  stream: IO[str], output_list: MutableSequence[str], label: str = ""
+  stream: IO[str],
+  output_list: MutableSequence[str],
+  label: str = "",
+  log_output: bool = True,
 ) -> None:
-  """Read a stream line-by-line, logging each line and appending it to
-  ``output_list``.
+  """Read a stream line-by-line, appending each line to ``output_list``.
+
+  Each line is also logged under the "user" category when ``log_output`` is set.
+  Shell tool calls pass ``log_output=False`` so a command that reads a source
+  file cannot leak its contents into the sandbox logs.
   """
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
-      logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
+      if log_output:
+        logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError, ValueError) as e:
     # ValueError("I/O operation on closed file"): an abandoned reader's `finally`
     # closes the stream mid-`readline`, and a stray traceback would litter the log.
@@ -152,12 +159,13 @@ def start_stream_readers(
   process: subprocess.Popen,
   stdout_sink: MutableSequence[str],
   stderr_sink: MutableSequence[str],
+  log_output: bool = True,
 ) -> list[threading.Thread]:
   """Start background threads draining `process`'s stdout and stderr.
 
-  Each line is logged as it arrives and appended to the matching sink. The threads
-  are daemons, so a reader left blocked on a pipe cannot prevent interpreter
-  shutdown.
+  Each line is appended to the matching sink, and logged as it arrives when
+  `log_output` is set. The threads are daemons, so a reader left blocked on a
+  pipe cannot prevent interpreter shutdown.
   """
   # The caller passed stdout/stderr=PIPE, so both are open.
   assert process.stdout is not None
@@ -167,13 +175,13 @@ def start_stream_readers(
   readers = [
     threading.Thread(
       target=read_stream,
-      args=(process.stdout, stdout_sink, "stdout"),
+      args=(process.stdout, stdout_sink, "stdout", log_output),
       name="stdout",
       daemon=True,
     ),
     threading.Thread(
       target=read_stream,
-      args=(process.stderr, stderr_sink, "stderr"),
+      args=(process.stderr, stderr_sink, "stderr", log_output),
       name="stderr",
       daemon=True,
     ),
