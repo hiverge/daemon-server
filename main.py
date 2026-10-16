@@ -145,7 +145,8 @@ def execute_python_function(
   python_executable = os.environ.get("PYTHON_EXECUTABLE", "python3")
   try:
     output = common_tools.run_command(
-      [python_executable, evaluation_script] + args, REPO_DIR, timeout
+      [python_executable, evaluation_script] + args, REPO_DIR, timeout,
+      log_output=True,
     )
     return output
   except common_tools.FunctionExecutionError as e:
@@ -307,7 +308,11 @@ def execute_shell_command(
     start_new_session=True,
   )
   with common_tools.sandboxed_process(process):
-    readers = common_tools.start_stream_readers(process, stdout_lines, stderr_lines)
+    # Shell output is returned to the agent but kept out of the logs: a command
+    # like `cat evaluator.py` would otherwise leak source code into them.
+    readers = common_tools.start_stream_readers(
+      process, stdout_lines, stderr_lines, log_output=False
+    )
     try:
       returncode = process.wait(timeout=timeout)
       timed_out = False

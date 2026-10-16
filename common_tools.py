@@ -18,15 +18,22 @@ logger = logging.getLogger(__name__)
 
 
 def read_stream(
-  stream: IO[str], output_list: MutableSequence[str], label: str = ""
+  stream: IO[str],
+  output_list: MutableSequence[str],
+  label: str = "",
+  log_output: bool = False,
 ) -> None:
-  """Read a stream line-by-line, logging each line and appending it to
-  ``output_list``.
+  """Read a stream line-by-line, appending each line to ``output_list``.
+
+  Each line is also logged under the "user" category when ``log_output`` is set.
+  Logging is off by default so shell tool output cannot leak source code into the
+  sandbox logs; evaluations opt in to keep their progress visible.
   """
   try:
     for line in iter(stream.readline, ""):
       output_list.append(line)
-      logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
+      if log_output:
+        logger.info("[%s] %s", label, line.rstrip("\r\n"), extra={"category": "user"})
   except (io.UnsupportedOperation, UnicodeDecodeError, ValueError) as e:
     # ValueError("I/O operation on closed file"): an abandoned reader's `finally`
     # closes the stream mid-`readline`, and a stray traceback would litter the log.
@@ -152,12 +159,14 @@ def start_stream_readers(
   process: subprocess.Popen,
   stdout_sink: MutableSequence[str],
   stderr_sink: MutableSequence[str],
+  log_output: bool = False,
 ) -> list[threading.Thread]:
   """Start background threads draining `process`'s stdout and stderr.
 
-  Each line is logged as it arrives and appended to the matching sink. The threads
-  are daemons, so a reader left blocked on a pipe cannot prevent interpreter
-  shutdown.
+  Each line is appended to the matching sink, and logged as it arrives when
+  `log_output` is set. Logging is off by default so shell tool output cannot leak
+  source code into the sandbox logs. The threads are daemons, so a reader left
+  blocked on a pipe cannot prevent interpreter shutdown.
   """
   # The caller passed stdout/stderr=PIPE, so both are open.
   assert process.stdout is not None
@@ -167,13 +176,13 @@ def start_stream_readers(
   readers = [
     threading.Thread(
       target=read_stream,
-      args=(process.stdout, stdout_sink, "stdout"),
+      args=(process.stdout, stdout_sink, "stdout", log_output),
       name="stdout",
       daemon=True,
     ),
     threading.Thread(
       target=read_stream,
-      args=(process.stderr, stderr_sink, "stderr"),
+      args=(process.stderr, stderr_sink, "stderr", log_output),
       name="stderr",
       daemon=True,
     ),
@@ -241,12 +250,17 @@ def run_command(
   cmd: str | Sequence[str],
   cwd: str = ".",
   timeout: float = 10.0,
+  log_output: bool = False,
 ) -> str:
   """Run a command with timeout and return the last line of its output.
 
   The command runs in its own process group, and both the wait for it to exit and
   the wait for its output to drain are bounded, so this returns even when the
   command leaves background processes behind.
+
+  When `log_output` is set, each output line is logged under the "user" category.
+  It is off by default so command output cannot leak source code into the sandbox
+  logs; evaluations opt in to keep their progress visible.
   """
 
   # PyInstaller can poison the subprocess environemnt. See below
@@ -274,13 +288,14 @@ def run_command(
     start_new_session=True,
   )
   with sandboxed_process(process):
-    # `read_stream` logs every line live, so only the last
-    # `MAX_ERROR_OUTPUT_LINES` of each stream are retained here: enough for the
-    # error tail and the final stdout line, and bounded no matter how much the
-    # evaluator prints.
+    # Only the last `MAX_ERROR_OUTPUT_LINES` of each stream are retained here:
+    # enough for the error tail and the final stdout line, and bounded no matter
+    # how much the command prints.
     stdout_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
     stderr_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
-    readers = start_stream_readers(process, stdout_lines, stderr_lines)
+    readers = start_stream_readers(
+      process, stdout_lines, stderr_lines, log_output=log_output
+    )
 
     try:
       returncode = process.wait(timeout=timeout)
