@@ -21,13 +21,13 @@ def read_stream(
   stream: IO[str],
   output_list: MutableSequence[str],
   label: str = "",
-  log_output: bool = True,
+  log_output: bool = False,
 ) -> None:
   """Read a stream line-by-line, appending each line to ``output_list``.
 
   Each line is also logged under the "user" category when ``log_output`` is set.
-  Shell tool calls pass ``log_output=False`` so a command that reads a source
-  file cannot leak its contents into the sandbox logs.
+  Logging is off by default so shell tool output cannot leak source code into the
+  sandbox logs; evaluations opt in to keep their progress visible.
   """
   try:
     for line in iter(stream.readline, ""):
@@ -159,13 +159,14 @@ def start_stream_readers(
   process: subprocess.Popen,
   stdout_sink: MutableSequence[str],
   stderr_sink: MutableSequence[str],
-  log_output: bool = True,
+  log_output: bool = False,
 ) -> list[threading.Thread]:
   """Start background threads draining `process`'s stdout and stderr.
 
   Each line is appended to the matching sink, and logged as it arrives when
-  `log_output` is set. The threads are daemons, so a reader left blocked on a
-  pipe cannot prevent interpreter shutdown.
+  `log_output` is set. Logging is off by default so shell tool output cannot leak
+  source code into the sandbox logs. The threads are daemons, so a reader left
+  blocked on a pipe cannot prevent interpreter shutdown.
   """
   # The caller passed stdout/stderr=PIPE, so both are open.
   assert process.stdout is not None
@@ -288,7 +289,9 @@ def run_command(
     # evaluator prints.
     stdout_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
     stderr_lines: deque[str] = deque(maxlen=MAX_ERROR_OUTPUT_LINES)
-    readers = start_stream_readers(process, stdout_lines, stderr_lines)
+    readers = start_stream_readers(
+      process, stdout_lines, stderr_lines, log_output=True
+    )
 
     try:
       returncode = process.wait(timeout=timeout)

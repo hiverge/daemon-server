@@ -225,7 +225,7 @@ class TestOrphanedDescendants:
     # kills the process group.
     pids: list[int] = []
 
-    def fail(process: subprocess.Popen, *_: object) -> None:
+    def fail(process: subprocess.Popen, *_: object, **__: object) -> None:
       pids.append(process.pid)
       raise RuntimeError("boom")
 
