@@ -225,6 +225,59 @@ class TestEvaluationArguments:
     }
 
 
+  def test_creates_missing_directories_for_code_files(self) -> None:
+    """
+    A code file in a directory the repo does not have yet is written, as
+    /shell already does, rather than failing the request.
+    """
+    # given a script that reads a file delivered into a new directory.
+    code_files = {
+      "read_input.py": (
+        "import json\n"
+        'print(json.dumps({"status": "success", '
+        '"result": {"data": open("new/dir/input.txt").read()}}))\n'
+      ),
+      "new/dir/input.txt": "delivered",
+    }
+
+    # when it is run.
+    output = main.execute_python_function(code_files, [], 30, "read_input.py")
+
+    # then the file was there.
+    assert json.loads(output)["result"]["data"] == "delivered"
+
+  @pytest.mark.parametrize(
+    ("route", "payload"),
+    [
+      (
+        "/run_code",
+        {"code": {"a_file/inside.txt": "x"}, "timeout": 30},
+      ),
+      (
+        "/shell",
+        {"cmd": "true", "cwd": ".", "code_files": {"a_file/inside.txt": "x"}},
+      ),
+    ],
+  )
+  def test_unwritable_code_file_returns_structured_client_error(
+    self, route: str, payload: dict
+  ) -> None:
+    """
+    A code file that cannot be written (here: under a path that is a file)
+    is a JSON 400 naming the file, not an HTML 500.
+    """
+    # given a repo where `a_file` is a file, not a directory.
+    (self.repo / "a_file").write_text("plain file")
+
+    # when a request delivers a file inside it.
+    response = main.app.test_client().post(route, json=payload)
+
+    # then the caller is told which file could not be written.
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["status"] == "failed"
+    assert body["error"].startswith("Cannot write code file a_file/inside.txt:")
+
 class TestShellCommandDescendants:
   """
   Tests that a shell command backgrounding work neither holds the request open

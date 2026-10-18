@@ -12,15 +12,21 @@ import sys
 import threading
 from functools import wraps
 from pathlib import Path
-from typing import Optional
 
-import common_tools
 from flask import Flask, jsonify, request
 from pythonjsonlogger import json as json_logger
 
-REPO_DIR = os.environ.get("REPO_DIR", "/app/")  # Directory where the repository is mounted
-BACKUP_DIR = os.environ.get("BACKUP_DIR", "/shared/repo/")  # Backup directory to restore original state
-TRACKING_GIT_DIR = os.environ.get("TRACKING_GIT_DIR", "/tmp/.agent_git")  # Git directory for tracking changes without affecting the actual repo
+import common_tools
+
+REPO_DIR = os.environ.get(
+  "REPO_DIR", "/app/"
+)  # Directory where the repository is mounted
+BACKUP_DIR = os.environ.get(
+  "BACKUP_DIR", "/shared/repo/"
+)  # Backup directory to restore original state
+TRACKING_GIT_DIR = os.environ.get(
+  "TRACKING_GIT_DIR", "/tmp/.agent_git"
+)  # Git directory for tracking changes without affecting the actual repo
 # Where bundled helper scripts are exposed inside the sandbox/shell
 SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/hiverge/scripts")
 
@@ -62,6 +68,7 @@ def lock_sandbox():
         sandbox_lock.release()
 
     return decorated_function
+
   return decorator
 
 
@@ -114,8 +121,30 @@ def _resolve_repo_path(
   return full_path
 
 
+def _apply_code_files(code_files: dict[str, str | None]) -> None:
+  """Lay the request's files over the restored repo, in order.
+
+  Content writes the file, creating missing parent directories; None deletes
+  it. Shared by /run_code and /shell so both accept the same files
+
+  Raises ValueError for a path that escapes the repo or cannot be written
+  (e.g. a file where a directory is), which both endpoints return as a JSON 400.
+  """
+  for rel_path, content in code_files.items():
+    try:
+      if content is None:
+        full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
+        full_path.unlink(missing_ok=True)
+        continue
+      full_path = _resolve_repo_path(rel_path)
+      full_path.parent.mkdir(parents=True, exist_ok=True)
+      full_path.write_text(content, encoding="utf-8")
+    except OSError as e:
+      raise ValueError(f"Cannot write code file {rel_path}: {e}") from e
+
+
 def execute_python_function(
-  code_files: dict[str, Optional[str]],
+  code_files: dict[str, str | None],
   args: list,
   timeout: float,
   evaluation_script: str,
@@ -129,14 +158,7 @@ def execute_python_function(
   # the quote characters inside `sys.argv[n]`.
   args = [str(arg) for arg in args]
 
-  for rel_path, range_and_content in code_files.items():
-    if range_and_content is None:
-      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
-      full_path.unlink(missing_ok=True)
-      continue
-    full_path = _resolve_repo_path(rel_path)
-    with full_path.open("w", encoding="utf-8") as f:
-      f.write(range_and_content)
+  _apply_code_files(code_files)
 
   # Run the Python program
   # Use system python3 instead of sys.executable to avoid issues with PyInstaller bundles
@@ -145,7 +167,9 @@ def execute_python_function(
   python_executable = os.environ.get("PYTHON_EXECUTABLE", "python3")
   try:
     output = common_tools.run_command(
-      [python_executable, evaluation_script] + args, REPO_DIR, timeout,
+      [python_executable, evaluation_script] + args,
+      REPO_DIR,
+      timeout,
       log_output=True,
     )
     return output
@@ -156,7 +180,12 @@ def execute_python_function(
     try:
       # If the script leaves checkpointed json data, find and return it
       output = common_tools.run_command(["cat", "checkpoint.json"], REPO_DIR)
-      return jsonify({"status": "success", "data": {"output": output, "metainfo": "Checkpoint"}}), 200
+      return jsonify(
+        {
+          "status": "success",
+          "data": {"output": output, "metainfo": "Checkpoint"},
+        }
+      ), 200
     except common_tools.FunctionExecutionError as ee:
       logger.info(
         "Failed to read checkpoint data: %s. Returning original error.", ee
@@ -195,9 +224,7 @@ def run_function():
       evaluation_script,
     )
 
-    result = execute_python_function(
-      code, args, timeout, evaluation_script
-    )
+    result = execute_python_function(code, args, timeout, evaluation_script)
     return result, 200
 
   except ValueError as e:
@@ -270,8 +297,11 @@ def get_changed_files():
 
 
 def execute_shell_command(
-  cmd: str, cwd: str, code_files: dict[str, Optional[str]], timeout: float,
-) -> "tuple[str, dict[str, Optional[str]]]":
+  cmd: str,
+  cwd: str,
+  code_files: dict[str, str | None],
+  timeout: float,
+) -> tuple[str, dict[str, str | None]]:
   """Execute a shell command.
 
   Returns the shell command output to give back to the LLM, and a mapping of
@@ -280,14 +310,7 @@ def execute_shell_command(
   # Restore the original repository state using rsync
   subprocess.run(["rsync", "-a", "--delete", BACKUP_DIR, REPO_DIR])
 
-  for rel_path, content in code_files.items():
-    if content is None:
-      full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
-      full_path.unlink(missing_ok=True)
-      continue
-    full_path = _resolve_repo_path(rel_path)
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_text(content, encoding="utf-8")
+  _apply_code_files(code_files)
 
   snapshot_work_tree()
 
@@ -379,7 +402,9 @@ def run_shell():
 
     output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
 
-    return jsonify({"status": "success", "result": {"output": output, "files": files}}), 200
+    return jsonify(
+      {"status": "success", "result": {"output": output, "files": files}}
+    ), 200
 
   except ValueError as e:
     logger.error("Invalid request: %s", e)
@@ -404,7 +429,9 @@ def materialize_shell_scripts() -> None:
       dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     logger.info("Materialized helper scripts into %s", SCRIPTS_DIR)
   except OSError as e:
-    logger.warning("Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e)
+    logger.warning(
+      "Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e
+    )
 
 
 if __name__ == "__main__":
@@ -418,6 +445,7 @@ if __name__ == "__main__":
   # Use waitress for production-ready WSGI server
   try:
     from waitress import serve
+
     logger.info(f"Starting production server on port {port}")
     serve(app, host="0.0.0.0", port=port)
   except ImportError:
