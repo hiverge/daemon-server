@@ -17,6 +17,7 @@ from flask import Flask, jsonify, request
 from pythonjsonlogger import json as json_logger
 
 import common_tools
+from workspace import WorkspaceError, WorkspaceRuntime
 
 REPO_DIR = os.environ.get(
   "REPO_DIR", "/app/"
@@ -29,6 +30,8 @@ TRACKING_GIT_DIR = os.environ.get(
 )  # Git directory for tracking changes without affecting the actual repo
 # Where bundled helper scripts are exposed inside the sandbox/shell
 SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/hiverge/scripts")
+DAEMON_MODE = os.environ.get("DAEMON_MODE", "evaluation")
+workspace_runtime: WorkspaceRuntime | None = None
 
 # Helper scripts bundled into the freeze (see daemon-server.spec `datas`) and
 # copied into SCRIPTS_DIR on startup so they are on hand in an interactive shell.
@@ -94,7 +97,7 @@ def _restart_container() -> None:
 @app.after_request
 def _restart_if_contaminated(response):
   """Restart the container once a survivor makes its measurements unreliable."""
-  if common_tools.is_contaminated():
+  if DAEMON_MODE == "evaluation" and common_tools.is_contaminated():
     # After the response: this evaluation ran on a clean pod, only later ones are
     # at risk.
     threading.Timer(_RESTART_GRACE, _restart_container).start()
@@ -199,13 +202,72 @@ def execute_python_function(
 @app.route("/health", methods=["GET"])
 def health_check():
   """Health check endpoint."""
+  if DAEMON_MODE == "workspace":
+    state = workspace_runtime.state if workspace_runtime else "starting"
+    healthy = state in ("idle", "active")
+    return jsonify(
+      {
+        "status": "healthy" if healthy else "unhealthy",
+        "mode": "workspace",
+        "state": state,
+      }
+    ), 200 if healthy else 503
   return jsonify({"status": "healthy"}), 200
+
+
+def _workspace() -> WorkspaceRuntime:
+  if DAEMON_MODE != "workspace":
+    raise WorkspaceError("Workspace mode is not enabled", 404)
+  if workspace_runtime is None:
+    raise WorkspaceError("Workspace runtime is not initialized")
+  return workspace_runtime
+
+
+def _workspace_request() -> dict:
+  data = request.get_json(silent=True)
+  if not isinstance(data, dict):
+    raise WorkspaceError("Request must be a JSON object", 400)
+  return data
+
+
+@app.errorhandler(WorkspaceError)
+def workspace_error(error):
+  return jsonify({"status": "failed", "error": str(error)}), error.status_code
+
+
+@app.route("/workspace/start", methods=["POST"])
+@lock_sandbox()
+def start_workspace():
+  runtime = _workspace()
+  data = _workspace_request()
+  runtime.start(data.get("assignment_token"))
+  return jsonify({"status": "success", "result": {"state": runtime.state}})
+
+
+@app.route("/workspace/health", methods=["POST"])
+@lock_sandbox()
+def workspace_health():
+  runtime = _workspace()
+  data = _workspace_request()
+  runtime.check_assignment(data.get("assignment_token"))
+  return jsonify({"status": "success", "result": {"state": runtime.state}})
+
+
+@app.route("/workspace/release", methods=["POST"])
+@lock_sandbox()
+def release_workspace():
+  runtime = _workspace()
+  data = _workspace_request()
+  runtime.release(data.get("assignment_token"))
+  return jsonify({"status": "success", "result": {"state": runtime.state}})
 
 
 @app.route("/run_code", methods=["POST"])
 @lock_sandbox()
 def run_function():
   """Run the Python function provided in the request."""
+  if DAEMON_MODE == "workspace":
+    raise WorkspaceError("/run_code is only available in evaluation mode", 404)
   try:
     if not request.is_json:
       logger.error("Request content type is not application/json")
@@ -349,22 +411,14 @@ def execute_shell_command(
     common_tools.kill_process_group(process)
     drained = common_tools.join_stream_readers(readers)
 
-  if timed_out:
-    output = f"Error: command timed out after {timeout}s"
-  else:
-    parts = []
-    if stdout_lines:
-      parts.append("".join(stdout_lines))
-    if stderr_lines:
-      parts.append(f"STDERR:\n{''.join(stderr_lines)}")
-    if returncode != 0:
-      parts.append(f"Exit code: {returncode}")
-    if not drained:
-      parts.append(
-        "[Output truncated: the command left background processes holding its "
-        "output.]"
-      )
-    output = "\n".join(parts) if parts else "(no output)"
+  output = common_tools.format_shell_output(
+    stdout_lines,
+    stderr_lines,
+    returncode,
+    timed_out,
+    drained,
+    timeout,
+  )
 
   return output, get_changed_files()
 
@@ -373,6 +427,28 @@ def execute_shell_command(
 @lock_sandbox()
 def run_shell():
   """Run a shell command from a given file state."""
+  if DAEMON_MODE == "workspace":
+    runtime = _workspace()
+    data = _workspace_request()
+    runtime.check_assignment(data.get("assignment_token"))
+    if data.get("code_files", {}) != {}:
+      raise WorkspaceError("Workspace /shell does not accept code_files overlays", 400)
+    try:
+      timeout = float(data.get("timeout", 120))
+    except (ValueError, TypeError, OverflowError):
+      raise WorkspaceError("timeout must be positive and finite", 400)
+    output = runtime.shell(
+      data.get("assignment_token"),
+      data.get("cmd"),
+      data.get("cwd", "/app"),
+      timeout,
+    )
+    return jsonify(
+      {
+        "status": "success",
+        "result": {"output": output, "files": {}},
+      }
+    ), 200
   try:
     if not request.is_json:
       logger.error("Request content type is not application/json")
@@ -435,9 +511,18 @@ def materialize_shell_scripts() -> None:
 
 
 if __name__ == "__main__":
-  # Ensure required directories exist
-  os.makedirs(REPO_DIR, exist_ok=True)
-  os.makedirs(BACKUP_DIR, exist_ok=True)
+  if DAEMON_MODE not in ("evaluation", "workspace"):
+    raise RuntimeError("DAEMON_MODE must be evaluation or workspace")
+  if DAEMON_MODE == "workspace":
+    workspace_runtime = WorkspaceRuntime(
+      os.environ.get("WORKSPACE_BASELINE_DIR", REPO_DIR),
+      os.environ.get("WORKSPACE_STORAGE_DIR", "/var/lib/daemon-workspaces"),
+    )
+    workspace_runtime.initialize()
+  else:
+    # Ensure required directories exist
+    os.makedirs(REPO_DIR, exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
   materialize_shell_scripts()
 
   port = int(os.environ.get("PORT", "8080"))

@@ -246,6 +246,32 @@ def sandboxed_process(
     release_process(process)
 
 
+def format_shell_output(
+  stdout_lines: Sequence[str],
+  stderr_lines: Sequence[str],
+  returncode: int | None,
+  timed_out: bool,
+  drained: bool,
+  timeout: float,
+) -> str:
+  """The /shell output contract, shared by evaluation and workspace commands."""
+  if timed_out:
+    return f"Error: command timed out after {timeout}s"
+  parts = []
+  if stdout_lines:
+    parts.append("".join(stdout_lines))
+  if stderr_lines:
+    parts.append(f"STDERR:\n{''.join(stderr_lines)}")
+  if returncode != 0:
+    parts.append(f"Exit code: {returncode}")
+  if not drained:
+    parts.append(
+      "[Output truncated: the command left background processes holding its "
+      "output.]"
+    )
+  return "\n".join(parts) if parts else "(no output)"
+
+
 def run_command(
   cmd: str | Sequence[str],
   cwd: str = ".",
