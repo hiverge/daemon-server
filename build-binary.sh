@@ -41,6 +41,9 @@ docker run --rm -i \
     "$MANYLINUX" bash -s <<'DOCKER_BUILD'
 set -e
 PYTHON_VERSION=3.12.8
+LINUX_HEADERS_VERSION=5.4
+LINUX_HEADERS_SHA256=bf338980b1670bca287f9994b7441c2361907635879169c64ae78364efc5f491
+LINUX_HEADERS_PREFIX=/opt/linux-headers
 
 # We build OpenSSL from source into our own prefix and link Python against that
 # single copy. The base OS openssl (1.0.2k) is too old for Python 3.12's ssl
@@ -54,7 +57,17 @@ OPENSSL_VERSION=3.0.15
 SSL_PREFIX=/opt/local-ssl
 
 echo "Installing build deps..."
-yum -y -q install libffi-devel bzip2-devel perl-core
+yum -y -q install libffi-devel bzip2-devel perl-core rsync
+
+# CPython exposes pidfd APIs only when the build headers define them. Export
+# newer Linux UAPI headers separately, retaining manylinux2014's glibc baseline.
+echo "Installing Linux ${LINUX_HEADERS_VERSION} userspace headers..."
+cd /tmp
+curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${LINUX_HEADERS_VERSION}.tar.xz" -o linux-headers.tar.xz
+echo "${LINUX_HEADERS_SHA256}  linux-headers.tar.xz" | sha256sum -c -
+tar xf linux-headers.tar.xz
+make -C "linux-${LINUX_HEADERS_VERSION}" headers_install \
+    INSTALL_HDR_PATH="${LINUX_HEADERS_PREFIX}" >/tmp/linux-headers-install.log 2>&1
 
 echo "Building OpenSSL ${OPENSSL_VERSION} from source into ${SSL_PREFIX}..."
 cd /tmp
@@ -79,7 +92,7 @@ cd "Python-${PYTHON_VERSION}"
 # --enable-shared produces libpython3.12.so, which PyInstaller requires.
 # --with-openssl points at the from-source prefix; --with-openssl-rpath=auto
 # bakes that lib dir into the interpreter so import ssl resolves it at runtime.
-./configure --enable-shared \
+CPPFLAGS="-I${LINUX_HEADERS_PREFIX}/include ${CPPFLAGS:-}" ./configure --enable-shared \
     --with-openssl="${SSL_PREFIX}" --with-openssl-rpath=auto >/tmp/configure.log 2>&1
 make -j"$(nproc)" >/tmp/make.log 2>&1
 make altinstall >/tmp/install.log 2>&1
@@ -92,11 +105,21 @@ PY=/usr/local/bin/python3.12
 # (3.x), not the stale system 1.0.2k -- a silent fallback would ship a binary
 # with broken TLS.
 "$PY" - <<'PYCHECK'
-import ssl, sys
+import os, signal, ssl, sys
 v = ssl.OPENSSL_VERSION
 print("ssl:", v)
 if not v.startswith("OpenSSL 3."):
     sys.exit(f"ERROR: ssl linked {v!r}, expected the from-source OpenSSL 3.x")
+required = (
+    (os, "pidfd_open"),
+    (os, "P_PIDFD"),
+    (os, "waitid"),
+    (signal, "pidfd_send_signal"),
+)
+missing = [f"{module.__name__}.{name}" for module, name in required if not hasattr(module, name)]
+if missing:
+    sys.exit(f"ERROR: Python lacks required workspace APIs: {', '.join(missing)}")
+print("Workspace pidfd APIs: available")
 PYCHECK
 "$PY" -m ensurepip --upgrade
 "$PY" -m pip install -q --upgrade pip
