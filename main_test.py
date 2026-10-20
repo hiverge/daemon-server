@@ -16,6 +16,12 @@ import main
 from conftest import wait_until_dead
 
 
+@pytest.fixture(autouse=True)
+def _scratch_directory(monkeypatch, tmp_path):
+  monkeypatch.setattr(main, "SCRATCH_DIR", str(tmp_path / "scratch"))
+  monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
+
+
 class _Response:
   """
   Stand-in for the Flask response that `after_request` hooks receive and return.
@@ -127,6 +133,23 @@ class TestEvaluationArguments:
 
     # then the script read the file the request delivered.
     assert json.loads(output)["result"]["data"] == '["a", "b"]'
+
+  def test_evaluation_gets_empty_scratch(self):
+    scratch = pathlib.Path(main.SCRATCH_DIR)
+    scratch.mkdir()
+    (scratch / "notes").write_text("session work")
+    script = (
+      f"from pathlib import Path\nscratch = Path({main.SCRATCH_DIR!r})\n"
+      "assert not list(scratch.iterdir())\n"
+      "scratch.joinpath('evaluation').write_text('temporary')\n"
+      "print('fresh')\n"
+    )
+    response = main.app.test_client().post(
+      "/run_code", json={"code": {"evaluator.py": script}, "timeout": 30}
+    )
+    assert response.status_code == 200
+    assert response.get_data(as_text=True).strip() == "fresh"
+    assert list(scratch.iterdir()) == []
 
   def test_deletes_tombstoned_files_before_running(self) -> None:
     """A null code-file value removes that path from the restored repo."""
@@ -597,3 +620,48 @@ class TestShellChangeTracking:
     # against the restored content rather than against the stale index entry.
     assert quiet == {}
     assert single == {"edit.txt": "third\n"}
+
+  def test_scratch_round_trip_and_worker_reuse(self):
+    client = main.app.test_client()
+
+    def run(cwd, cmd, **fields):
+      response = client.post(
+        "/shell",
+        json={"cwd": cwd, "cmd": cmd, "code_files": {}, **fields},
+      )
+      assert response.status_code == 200
+      return response.get_json()["result"]
+
+    first = run(
+      "../scratch",
+      "cat notes.md; printf after > notes.md; "
+      "printf new > new.txt; printf candidate > ../repo/main.py",
+      scratch_files={"notes.md": "before", "kept.md": "unchanged"},
+    )
+    assert first == {
+      "output": "before",
+      "files": {"main.py": "candidate"},
+      "scratch_files": {"notes.md": "after", "new.txt": "new"},
+    }
+    snapshot = {"kept.md": "unchanged", **first["scratch_files"]}
+    second = run(main.SCRATCH_DIR, "cat notes.md", scratch_files=snapshot)
+    assert second == {"output": "after", "files": {}, "scratch_files": {}}
+    fresh = run(
+      f"{main.SCRATCH_DIR}/../repo",
+      "test ! -e ../scratch/notes.md && echo fresh",
+    )
+    assert fresh == {"output": "fresh\n", "files": {}, "scratch_files": {}}
+    assert list(pathlib.Path(main.SCRATCH_DIR).iterdir()) == []
+    assert not pathlib.Path(f"{self.tracking}.scratch").exists()
+
+  @pytest.mark.parametrize(
+    "fields", [{"cwd": ".."}, {"scratch_files": {"../outside.txt": "bad"}}]
+  )
+  def test_scratch_request_boundaries(self, fields):
+    response = main.app.test_client().post(
+      "/shell", json={"cwd": ".", "cmd": "true", "code_files": {}, **fields}
+    )
+    assert response.status_code == 400
+    assert response.get_json()["status"] == "failed"
+    assert not (self.repo.parent / "outside.txt").exists()
+    assert list(pathlib.Path(main.SCRATCH_DIR).iterdir()) == []

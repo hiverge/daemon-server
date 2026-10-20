@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
 
@@ -27,6 +28,7 @@ BACKUP_DIR = os.environ.get(
 TRACKING_GIT_DIR = os.environ.get(
   "TRACKING_GIT_DIR", "/tmp/.agent_git"
 )  # Git directory for tracking changes without affecting the actual repo
+SCRATCH_DIR = "/scratch"
 # Where bundled helper scripts are exposed inside the sandbox/shell
 SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/hiverge/scripts")
 
@@ -102,14 +104,14 @@ def _restart_if_contaminated(response):
 
 
 def _resolve_repo_path(
-  rel_path: str, *, follow_final_symlink: bool = True
+  rel_path: str, *, follow_final_symlink: bool = True, root: str | None = None
 ) -> Path:
-  """Resolve an overlay path and require it to remain inside the repository.
+  """Resolve an overlay path and require it to remain inside its root.
 
   Writes follow the final symlink, matching normal file-open behaviour. Deletions
   resolve only the parent so unlinking removes the named symlink itself.
   """
-  repo_root = Path(REPO_DIR).resolve()
+  repo_root = Path(REPO_DIR if root is None else root).resolve()
   requested_path = repo_root / rel_path
   full_path = (
     requested_path.resolve()
@@ -121,7 +123,9 @@ def _resolve_repo_path(
   return full_path
 
 
-def _apply_code_files(code_files: dict[str, str | None]) -> None:
+def _apply_code_files(
+  code_files: dict[str, str | None], *, root: str | None = None
+) -> None:
   """Lay the request's files over the restored repo, in order.
 
   Content writes the file, creating missing parent directories; None deletes
@@ -133,14 +137,37 @@ def _apply_code_files(code_files: dict[str, str | None]) -> None:
   for rel_path, content in code_files.items():
     try:
       if content is None:
-        full_path = _resolve_repo_path(rel_path, follow_final_symlink=False)
+        full_path = _resolve_repo_path(
+          rel_path, follow_final_symlink=False, root=root
+        )
         full_path.unlink(missing_ok=True)
         continue
-      full_path = _resolve_repo_path(rel_path)
+      full_path = _resolve_repo_path(rel_path, root=root)
       full_path.parent.mkdir(parents=True, exist_ok=True)
       full_path.write_text(content, encoding="utf-8")
     except OSError as e:
       raise ValueError(f"Cannot write code file {rel_path}: {e}") from e
+
+
+@contextmanager
+def _scratch_workspace(files: dict[str, str]):
+  """Materialize a request's scratch snapshot and clear it before worker reuse."""
+  root = Path(SCRATCH_DIR)
+
+  def reset():
+    shutil.rmtree(_git_paths(True)[1], ignore_errors=True)
+    if root.is_dir() and not root.is_symlink():
+      shutil.rmtree(root)
+    else:
+      root.unlink(missing_ok=True)
+    root.mkdir(parents=True)
+
+  reset()
+  try:
+    _apply_code_files(files, root=SCRATCH_DIR)
+    yield
+  finally:
+    reset()
 
 
 def execute_python_function(
@@ -224,7 +251,8 @@ def run_function():
       evaluation_script,
     )
 
-    result = execute_python_function(code, args, timeout, evaluation_script)
+    with _scratch_workspace({}):
+      result = execute_python_function(code, args, timeout, evaluation_script)
     return result, 200
 
   except ValueError as e:
@@ -242,22 +270,32 @@ def run_function():
     return jsonify({"status": "failed", "error": "Internal server error"}), 500
 
 
-def _git(args: list[str]) -> list[str]:
+def _git_paths(scratch: bool) -> tuple[str, str]:
+  return (
+    (SCRATCH_DIR, f"{TRACKING_GIT_DIR}.scratch")
+    if scratch
+    else (REPO_DIR, TRACKING_GIT_DIR)
+  )
+
+
+def _git(args: list[str], *, scratch: bool = False) -> list[str]:
   """
   Wrapper around git which uses an external git directory to track changes
   without affecting the actual repo.
   """
-  return ["git", "--git-dir", TRACKING_GIT_DIR, "--work-tree", REPO_DIR] + args
+  root, tracking = _git_paths(scratch)
+  return ["git", "--git-dir", tracking, "--work-tree", root] + args
 
 
-def init_git_tracking():
+def init_git_tracking(*, scratch: bool = False):
   """Initialize an external git tracking repo to capture workspace changes."""
-  shutil.rmtree(TRACKING_GIT_DIR, ignore_errors=True)
+  _, tracking = _git_paths(scratch)
+  shutil.rmtree(tracking, ignore_errors=True)
 
   commands = [
-    _git(["init"]),
-    _git(["config", "user.email", "agent@docker"]),
-    _git(["config", "user.name", "Agent"]),
+    _git(["init"], scratch=scratch),
+    _git(["config", "user.email", "agent@docker"], scratch=scratch),
+    _git(["config", "user.name", "Agent"], scratch=scratch),
   ]
 
   for command in commands:
@@ -267,28 +305,34 @@ def init_git_tracking():
       raise RuntimeError(f"Failed to initialize git repository: {error_msg}")
 
 
-def snapshot_work_tree():
+def snapshot_work_tree(*, scratch: bool = False):
   """Stage the pre-command state of the work tree in the tracking repo."""
-  if not (Path(TRACKING_GIT_DIR) / "HEAD").exists():
-    init_git_tracking()
+  _, tracking = _git_paths(scratch)
+  if not (Path(tracking) / "HEAD").exists():
+    init_git_tracking(scratch=scratch)
 
-  result = subprocess.run(_git(["add", "-A"]), capture_output=True, text=True)
+  result = subprocess.run(
+    _git(["add", "-A"], scratch=scratch), capture_output=True, text=True
+  )
   if result.returncode != 0:
     error_msg = result.stderr.strip() or result.stdout.strip()
     raise RuntimeError(f"Failed to stage changes: {error_msg}")
 
 
-def get_changed_files():
+def get_changed_files(*, scratch: bool = False):
   """Return a dict of {relative_path: content} for all files changed since init."""
   # This git command returns all untracked files and files with unstaged changes
   args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
-  result = subprocess.run(_git(args), capture_output=True, text=True)
+  result = subprocess.run(
+    _git(args, scratch=scratch), capture_output=True, text=True
+  )
   filenames = [name for name in result.stdout.split("\0") if name]
 
+  root, _ = _git_paths(scratch)
   files = {}
   for fn in filenames:
     try:
-      files[fn] = (Path(REPO_DIR) / fn).read_text(encoding="utf-8")
+      files[fn] = (Path(root) / fn).read_text(encoding="utf-8")
     except FileNotFoundError:
       files[fn] = None  # deleted by the command
     except (UnicodeDecodeError, ValueError):
@@ -301,6 +345,8 @@ def execute_shell_command(
   cwd: str,
   code_files: dict[str, str | None],
   timeout: float,
+  *,
+  scratch: bool = False,
 ) -> tuple[str, dict[str, str | None]]:
   """Execute a shell command.
 
@@ -313,6 +359,8 @@ def execute_shell_command(
   _apply_code_files(code_files)
 
   snapshot_work_tree()
+  if scratch:
+    snapshot_work_tree(scratch=True)
 
   # Run the shell command in its own process group, and time out on its own exit
   # rather than on its output reaching end-of-stream. A backgrounded job (`cmd &`)
@@ -390,20 +438,32 @@ def run_shell():
       return jsonify({"status": "failed", "error": message}), 400
 
     cmd = data["cmd"]
-    cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
-    if not cwd.is_relative_to(Path(REPO_DIR).resolve()):
-      return jsonify(
-        {"status": "failed", "error": "cwd escapes repo directory"}
-      ), 400
     code_files = data["code_files"]
     timeout = float(data.get("timeout", 120))
 
     logger.info("Executing shell command with timeout=%s", timeout)
 
-    output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
+    with _scratch_workspace(data.get("scratch_files", {})):
+      cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
+      if not any(
+        cwd.is_relative_to(Path(root).resolve())
+        for root in (REPO_DIR, SCRATCH_DIR)
+      ):
+        raise ValueError("cwd escapes workspace directories")
+      output, files = execute_shell_command(
+        cmd, str(cwd), code_files, timeout, scratch=True
+      )
+      scratch_files = get_changed_files(scratch=True)
 
     return jsonify(
-      {"status": "success", "result": {"output": output, "files": files}}
+      {
+        "status": "success",
+        "result": {
+          "output": output,
+          "files": files,
+          "scratch_files": scratch_files,
+        },
+      }
     ), 200
 
   except ValueError as e:
