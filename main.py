@@ -28,7 +28,8 @@ BACKUP_DIR = os.environ.get(
 TRACKING_GIT_DIR = os.environ.get(
   "TRACKING_GIT_DIR", "/tmp/.agent_git"
 )  # Git directory for tracking changes without affecting the actual repo
-SCRATCH_DIR = "/scratch"
+SCRATCH_DIR = os.environ.get("SCRATCH_DIR", "/scratch")
+SCRATCH_TRACKING_GIT_DIR = f"{TRACKING_GIT_DIR}.scratch"
 # Where bundled helper scripts are exposed inside the sandbox/shell
 SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/hiverge/scripts")
 
@@ -104,29 +105,29 @@ def _restart_if_contaminated(response):
 
 
 def _resolve_repo_path(
-  rel_path: str, *, follow_final_symlink: bool = True, root: str | None = None
+  rel_path: str, dir: str, *, follow_final_symlink: bool = True
 ) -> Path:
   """Resolve an overlay path and require it to remain inside its root.
 
   Writes follow the final symlink, matching normal file-open behaviour. Deletions
   resolve only the parent so unlinking removes the named symlink itself.
   """
-  repo_root = Path(REPO_DIR if root is None else root).resolve()
-  requested_path = repo_root / rel_path
+  root = Path(dir).resolve()
+  requested_path = root / rel_path
   full_path = (
     requested_path.resolve()
     if follow_final_symlink
     else requested_path.parent.resolve() / requested_path.name
   )
-  if not full_path.is_relative_to(repo_root):
+  if not full_path.is_relative_to(root):
     raise ValueError(f"Path escapes repo directory: {rel_path}")
   return full_path
 
 
 def _apply_code_files(
-  code_files: dict[str, str | None], *, root: str | None = None
+  code_files: dict[str, str | None], dir: str
 ) -> None:
-  """Lay the request's files over the restored repo, in order.
+  """Lay the request's files over the supplied directory, in order.
 
   Content writes the file, creating missing parent directories; None deletes
   it. Shared by /run_code and /shell so both accept the same files
@@ -138,11 +139,11 @@ def _apply_code_files(
     try:
       if content is None:
         full_path = _resolve_repo_path(
-          rel_path, follow_final_symlink=False, root=root
+          rel_path, dir, follow_final_symlink=False
         )
         full_path.unlink(missing_ok=True)
         continue
-      full_path = _resolve_repo_path(rel_path, root=root)
+      full_path = _resolve_repo_path(rel_path, dir)
       full_path.parent.mkdir(parents=True, exist_ok=True)
       full_path.write_text(content, encoding="utf-8")
     except OSError as e:
@@ -155,7 +156,7 @@ def _scratch_workspace(files: dict[str, str]):
   root = Path(SCRATCH_DIR)
 
   def reset():
-    shutil.rmtree(_git_paths(True)[1], ignore_errors=True)
+    shutil.rmtree(SCRATCH_TRACKING_GIT_DIR, ignore_errors=True)
     if root.is_dir() and not root.is_symlink():
       shutil.rmtree(root)
     else:
@@ -164,7 +165,7 @@ def _scratch_workspace(files: dict[str, str]):
 
   reset()
   try:
-    _apply_code_files(files, root=SCRATCH_DIR)
+    _apply_code_files(files, SCRATCH_DIR)
     yield
   finally:
     reset()
@@ -185,7 +186,7 @@ def execute_python_function(
   # the quote characters inside `sys.argv[n]`.
   args = [str(arg) for arg in args]
 
-  _apply_code_files(code_files)
+  _apply_code_files(code_files, REPO_DIR)
 
   # Run the Python program
   # Use system python3 instead of sys.executable to avoid issues with PyInstaller bundles
@@ -251,8 +252,7 @@ def run_function():
       evaluation_script,
     )
 
-    with _scratch_workspace({}):
-      result = execute_python_function(code, args, timeout, evaluation_script)
+    result = execute_python_function(code, args, timeout, evaluation_script)
     return result, 200
 
   except ValueError as e:
@@ -270,32 +270,22 @@ def run_function():
     return jsonify({"status": "failed", "error": "Internal server error"}), 500
 
 
-def _git_paths(scratch: bool) -> tuple[str, str]:
-  return (
-    (SCRATCH_DIR, f"{TRACKING_GIT_DIR}.scratch")
-    if scratch
-    else (REPO_DIR, TRACKING_GIT_DIR)
-  )
-
-
-def _git(args: list[str], *, scratch: bool = False) -> list[str]:
+def _git(args: list[str], dir: str, git_dir: str) -> list[str]:
   """
   Wrapper around git which uses an external git directory to track changes
   without affecting the actual repo.
   """
-  root, tracking = _git_paths(scratch)
-  return ["git", "--git-dir", tracking, "--work-tree", root] + args
+  return ["git", "--git-dir", git_dir, "--work-tree", dir] + args
 
 
-def init_git_tracking(*, scratch: bool = False):
+def init_git_tracking(dir: str, git_dir: str):
   """Initialize an external git tracking repo to capture workspace changes."""
-  _, tracking = _git_paths(scratch)
-  shutil.rmtree(tracking, ignore_errors=True)
+  shutil.rmtree(git_dir, ignore_errors=True)
 
   commands = [
-    _git(["init"], scratch=scratch),
-    _git(["config", "user.email", "agent@docker"], scratch=scratch),
-    _git(["config", "user.name", "Agent"], scratch=scratch),
+    _git(["init"], dir, git_dir),
+    _git(["config", "user.email", "agent@docker"], dir, git_dir),
+    _git(["config", "user.name", "Agent"], dir, git_dir),
   ]
 
   for command in commands:
@@ -305,34 +295,32 @@ def init_git_tracking(*, scratch: bool = False):
       raise RuntimeError(f"Failed to initialize git repository: {error_msg}")
 
 
-def snapshot_work_tree(*, scratch: bool = False):
+def snapshot_work_tree(dir: str, git_dir: str):
   """Stage the pre-command state of the work tree in the tracking repo."""
-  _, tracking = _git_paths(scratch)
-  if not (Path(tracking) / "HEAD").exists():
-    init_git_tracking(scratch=scratch)
+  if not (Path(git_dir) / "HEAD").exists():
+    init_git_tracking(dir, git_dir)
 
   result = subprocess.run(
-    _git(["add", "-A"], scratch=scratch), capture_output=True, text=True
+    _git(["add", "-A"], dir, git_dir), capture_output=True, text=True
   )
   if result.returncode != 0:
     error_msg = result.stderr.strip() or result.stdout.strip()
     raise RuntimeError(f"Failed to stage changes: {error_msg}")
 
 
-def get_changed_files(*, scratch: bool = False):
+def get_changed_files(dir: str, git_dir: str):
   """Return a dict of {relative_path: content} for all files changed since init."""
   # This git command returns all untracked files and files with unstaged changes
   args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
   result = subprocess.run(
-    _git(args, scratch=scratch), capture_output=True, text=True
+    _git(args, dir, git_dir), capture_output=True, text=True
   )
   filenames = [name for name in result.stdout.split("\0") if name]
 
-  root, _ = _git_paths(scratch)
   files = {}
   for fn in filenames:
     try:
-      files[fn] = (Path(root) / fn).read_text(encoding="utf-8")
+      files[fn] = (Path(dir) / fn).read_text(encoding="utf-8")
     except FileNotFoundError:
       files[fn] = None  # deleted by the command
     except (UnicodeDecodeError, ValueError):
@@ -345,8 +333,6 @@ def execute_shell_command(
   cwd: str,
   code_files: dict[str, str | None],
   timeout: float,
-  *,
-  scratch: bool = False,
 ) -> tuple[str, dict[str, str | None]]:
   """Execute a shell command.
 
@@ -356,11 +342,10 @@ def execute_shell_command(
   # Restore the original repository state using rsync
   subprocess.run(["rsync", "-a", "--delete", BACKUP_DIR, REPO_DIR])
 
-  _apply_code_files(code_files)
+  _apply_code_files(code_files, REPO_DIR)
 
-  snapshot_work_tree()
-  if scratch:
-    snapshot_work_tree(scratch=True)
+  snapshot_work_tree(REPO_DIR, TRACKING_GIT_DIR)
+  snapshot_work_tree(SCRATCH_DIR, SCRATCH_TRACKING_GIT_DIR)
 
   # Run the shell command in its own process group, and time out on its own exit
   # rather than on its output reaching end-of-stream. A backgrounded job (`cmd &`)
@@ -414,7 +399,7 @@ def execute_shell_command(
       )
     output = "\n".join(parts) if parts else "(no output)"
 
-  return output, get_changed_files()
+  return output, get_changed_files(REPO_DIR, TRACKING_GIT_DIR)
 
 
 @app.route("/shell", methods=["POST"])
@@ -450,10 +435,8 @@ def run_shell():
         for root in (REPO_DIR, SCRATCH_DIR)
       ):
         raise ValueError("cwd escapes workspace directories")
-      output, files = execute_shell_command(
-        cmd, str(cwd), code_files, timeout, scratch=True
-      )
-      scratch_files = get_changed_files(scratch=True)
+      output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
+      scratch_files = get_changed_files(SCRATCH_DIR, SCRATCH_TRACKING_GIT_DIR)
 
     return jsonify(
       {

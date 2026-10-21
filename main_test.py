@@ -18,8 +18,12 @@ from conftest import wait_until_dead
 
 @pytest.fixture(autouse=True)
 def _scratch_directory(monkeypatch, tmp_path):
+  (tmp_path / "scratch").mkdir()
   monkeypatch.setattr(main, "SCRATCH_DIR", str(tmp_path / "scratch"))
   monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
+  monkeypatch.setattr(
+    main, "SCRATCH_TRACKING_GIT_DIR", str(tmp_path / ".agent_git.scratch")
+  )
 
 
 class _Response:
@@ -133,23 +137,6 @@ class TestEvaluationArguments:
 
     # then the script read the file the request delivered.
     assert json.loads(output)["result"]["data"] == '["a", "b"]'
-
-  def test_evaluation_gets_empty_scratch(self):
-    scratch = pathlib.Path(main.SCRATCH_DIR)
-    scratch.mkdir()
-    (scratch / "notes").write_text("session work")
-    script = (
-      f"from pathlib import Path\nscratch = Path({main.SCRATCH_DIR!r})\n"
-      "assert not list(scratch.iterdir())\n"
-      "scratch.joinpath('evaluation').write_text('temporary')\n"
-      "print('fresh')\n"
-    )
-    response = main.app.test_client().post(
-      "/run_code", json={"code": {"evaluator.py": script}, "timeout": 30}
-    )
-    assert response.status_code == 200
-    assert response.get_data(as_text=True).strip() == "fresh"
-    assert list(scratch.iterdir()) == []
 
   def test_deletes_tombstoned_files_before_running(self) -> None:
     """A null code-file value removes that path from the restored repo."""
@@ -652,7 +639,7 @@ class TestShellChangeTracking:
     )
     assert fresh == {"output": "fresh\n", "files": {}, "scratch_files": {}}
     assert list(pathlib.Path(main.SCRATCH_DIR).iterdir()) == []
-    assert not pathlib.Path(f"{self.tracking}.scratch").exists()
+    assert not pathlib.Path(main.SCRATCH_TRACKING_GIT_DIR).exists()
 
   @pytest.mark.parametrize(
     "fields", [{"cwd": ".."}, {"scratch_files": {"../outside.txt": "bad"}}]
