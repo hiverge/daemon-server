@@ -44,6 +44,7 @@ The binary bundles:
 - psutil library
 - All Python standard library modules
 - Daemon server application code (main.py, common_tools.py)
+- Workspace runtime (workspace.py)
 
 ## File Naming Convention
 
@@ -124,6 +125,23 @@ The binary is self-contained and has no external dependencies. It works with any
 - Custom user images
 
 No Python installation or pip packages required in the base image.
+
+## Workspace Deployment
+
+Workspace mode additionally requires Linux 5.4+ with OverlayFS, nested user/PID/network/IPC/UTS namespaces and pidfds; Bash, Bubblewrap (tested with 0.8.0), and util-linux. Install workload tools in the image before startup.
+
+Run as uid 0 with the normal container capabilities plus `CAP_SYS_ADMIN`. Allow namespace/mount syscalls through seccomp/AppArmor and provide an unmasked `/proc`.
+
+Prepare an immutable repository baseline and an empty, disk-backed storage volume supporting OverlayFS upper/work directories (for example, ext4/XFS; not tmpfs). Keep both outside the image's tool directories.
+
+```sh
+DAEMON_MODE=workspace \
+WORKSPACE_BASELINE_DIR=/app \
+WORKSPACE_STORAGE_DIR=/var/lib/daemon-workspaces \
+unshare --mount --propagation private /path/to/daemon-server
+```
+
+Restrict HTTP access through deployment controls. Use `restartPolicy: Never` and replace unhealthy containers after failed cleanup. Evaluation mode remains the default.
 
 ## Troubleshooting
 
