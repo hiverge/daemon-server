@@ -361,6 +361,7 @@ def execute_shell_command(
     stderr=subprocess.PIPE,
     encoding="utf-8",
     errors="replace",
+    env=common_tools.subprocess_env(),
     start_new_session=True,
   )
   with common_tools.sandboxed_process(process):
