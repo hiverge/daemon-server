@@ -246,6 +246,21 @@ def sandboxed_process(
     release_process(process)
 
 
+def subprocess_env() -> dict[str, str]:
+  """Restore the sandbox's library paths for external programs."""
+  # PyInstaller can poison the subprocess environemnt. See below
+  # https://pyinstaller.org/en/stable/runtime-information.html?ld-library-path-libpath-considerations=#ld-library-path-libpath-considerations
+  env = os.environ.copy()
+  orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+  if orig:
+    env["LD_LIBRARY_PATH"] = orig
+  else:
+    env.pop("LD_LIBRARY_PATH", None)
+  # Also configure Python to use unbuffered output so we can stream the output
+  env["PYTHONUNBUFFERED"] = "1"
+  return env
+
+
 def run_command(
   cmd: str | Sequence[str],
   cwd: str = ".",
@@ -263,17 +278,6 @@ def run_command(
   logs; evaluations opt in to keep their progress visible.
   """
 
-  # PyInstaller can poison the subprocess environemnt. See below
-  # https://pyinstaller.org/en/stable/runtime-information.html?ld-library-path-libpath-considerations=#ld-library-path-libpath-considerations
-  env = os.environ.copy()
-  orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
-  if orig:
-    env["LD_LIBRARY_PATH"] = orig
-  else:
-    env.pop("LD_LIBRARY_PATH", None)
-  # Also configure Python to use unbuffered output so we can stream the output 
-  env["PYTHONUNBUFFERED"] = "1"
-
   process = subprocess.Popen(
     cmd,
     stdout=subprocess.PIPE,
@@ -282,7 +286,7 @@ def run_command(
     bufsize=1,  # Allows real-time output
     universal_newlines=True,
     text=True,
-    env=env,
+    env=subprocess_env(),
     # Own process group, so everything the command spawns can be cleaned up
     # together. See `kill_process_group`.
     start_new_session=True,

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import signal
 import sys
 import time
@@ -24,6 +25,64 @@ def _scratch_directory(monkeypatch, tmp_path):
   monkeypatch.setattr(
     main, "SCRATCH_TRACKING_GIT_DIR", str(tmp_path / ".agent_git.scratch")
   )
+
+
+@pytest.mark.parametrize("route", ["run_code", "shell"])
+@pytest.mark.parametrize(
+  "original,current,expected",
+  [
+    (
+      "/usr/local/cuda/lib64:/opt/lib",
+      "/tmp/_MEItest:/usr/local/cuda/lib64:/opt/lib",
+      "/usr/local/cuda/lib64:/opt/lib",
+    ),
+    (None, "/tmp/_MEItest", None),
+    ("", "/tmp/_MEItest", None),
+    (None, None, None),
+  ],
+)
+def test_both_execution_paths_restore_child_library_environment(
+  monkeypatch, tmp_path, route, original, current, expected
+):
+  repo, backup = tmp_path / "repo", tmp_path / "backup"
+  repo.mkdir()
+  backup.mkdir()
+  monkeypatch.setattr(main, "REPO_DIR", f"{repo}/")
+  monkeypatch.setattr(main, "BACKUP_DIR", f"{backup}/")
+  monkeypatch.setenv("PYTHON_EXECUTABLE", sys.executable)
+  monkeypatch.setenv("PYTHONUNBUFFERED", "0")
+  for name, value in (
+    ("LD_LIBRARY_PATH", current),
+    ("LD_LIBRARY_PATH_ORIG", original),
+  ):
+    if value is None:
+      monkeypatch.delenv(name, raising=False)
+    else:
+      monkeypatch.setenv(name, value)
+  before = dict(os.environ)
+  script = (
+    "import ctypes, json, os\n"
+    "print(json.dumps({name: os.environ.get(name) for name in "
+    "['LD_LIBRARY_PATH', 'LD_LIBRARY_PATH_ORIG', 'PYTHONUNBUFFERED']}))\n"
+  )
+  files = {"inspect_environment.py": script}
+  if route == "run_code":
+    output = main.execute_python_function(
+      files, [], 30, "inspect_environment.py"
+    )
+  else:
+    output, _ = main.execute_shell_command(
+      shlex.join([sys.executable, "inspect_environment.py"]),
+      str(repo),
+      files,
+      30,
+    )
+  assert json.loads(output) == {
+    "LD_LIBRARY_PATH": expected,
+    "LD_LIBRARY_PATH_ORIG": None,
+    "PYTHONUNBUFFERED": "1",
+  }
+  assert dict(os.environ) == before  # The daemon retains its bundled libraries.
 
 
 class _Response:
