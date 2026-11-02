@@ -10,7 +10,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Generator, MutableSequence, Sequence
-from typing import IO
+from contextvars import ContextVar
+from typing import IO, Callable
 
 import requests
 
@@ -79,15 +80,44 @@ PROCESS_GROUP_KILL_TIMEOUT = 5.0
 # competes for CPU, memory and I/O with whatever runs next, so a candidate timed
 # against it is scored on a machine that is not idle.
 _contaminated = threading.Event()
+_command_cleanup: ContextVar[Callable[[], None] | None] = ContextVar(
+  "command_cleanup", default=None
+)
+
+
+@contextlib.contextmanager
+def command_cleanup(callback: Callable[[], None]):
+  """Attach the request's process cleanup to managed subprocess exits.
+
+  The callback runs after kill/reap in sandboxed_process(), before callers
+  collect final diffs or checkpoint results. ContextVar keeps the hook local to
+  the request's execution context and restores any previous hook on exit.
+  """
+  token = _command_cleanup.set(callback)
+  try:
+    yield
+  finally:
+    _command_cleanup.reset(token)
+
+
+def execution_user() -> dict:
+  """Optional isolated command UID; permissions are supplied by the operator."""
+  uid = os.environ.get("SANDBOX_EXECUTION_UID")
+  if uid is None:
+    return {}
+  value = int(uid)
+  if value < 0:
+    raise ValueError("Execution UID must be nonnegative")
+  return {"user": value}
 
 
 def mark_contaminated() -> None:
-  """Record that a process survived this daemon's attempt to kill it."""
+  """Record that execution or reset left the sandbox unsafe for reuse."""
   _contaminated.set()
 
 
 def is_contaminated() -> bool:
-  """Whether a command left a process this daemon could not kill."""
+  """Whether execution or reset has made this sandbox unsafe for reuse."""
   return _contaminated.is_set()
 
 
@@ -143,8 +173,8 @@ def kill_process_group(process: subprocess.Popen) -> None:
 
   Signals only. `release_process` does the bounded wait for the leader to die.
 
-  Best effort — a descendant that calls `setsid()` or double-forks leaves the
-  group and survives.
+  A descendant that calls setsid() leaves the group. The request's cleanup
+  callback handles new processes in the execution UID scope.
   """
   # The group id is the leader's pid. `os.getpgid()` would fail once the leader
   # has been reaped, while the rest of the group is still running.
@@ -236,14 +266,24 @@ def release_process(process: subprocess.Popen) -> None:
 def sandboxed_process(
   process: subprocess.Popen,
 ) -> Generator[subprocess.Popen, None, None]:
-  """Kill and reap `process`'s group on the way out, however the block ends."""
+  """Release a command, then invoke the request's wider process cleanup.
+
+  Both success and exception paths release the managed subprocess. A registered
+  callback additionally handles processes detached from its group. The callback
+  is in a separate finally so it runs even if releasing the subprocess fails.
+  """
   try:
     yield process
   finally:
-    # A reaped leader's pid can already belong to an unrelated group.
-    if process.poll() is None:
-      kill_process_group(process)
-    release_process(process)
+    try:
+      # A reaped leader's pid can already belong to an unrelated group.
+      if process.poll() is None:
+        kill_process_group(process)
+      release_process(process)
+    finally:
+      callback = _command_cleanup.get()
+      if callback is not None:
+        callback()
 
 
 def run_command(
@@ -271,7 +311,7 @@ def run_command(
     env["LD_LIBRARY_PATH"] = orig
   else:
     env.pop("LD_LIBRARY_PATH", None)
-  # Also configure Python to use unbuffered output so we can stream the output 
+  # Also configure Python to use unbuffered output so we can stream the output
   env["PYTHONUNBUFFERED"] = "1"
 
   process = subprocess.Popen(
@@ -286,6 +326,7 @@ def run_command(
     # Own process group, so everything the command spawns can be cleaned up
     # together. See `kill_process_group`.
     start_new_session=True,
+    **execution_user(),
   )
   with sandboxed_process(process):
     # Only the last `MAX_ERROR_OUTPUT_LINES` of each stream are retained here:

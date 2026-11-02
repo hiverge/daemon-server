@@ -18,6 +18,7 @@ from flask import Flask, jsonify, request
 from pythonjsonlogger import json as json_logger
 
 import common_tools
+from sandbox_reset import ResetIncomplete, SandboxReset
 
 REPO_DIR = os.environ.get(
   "REPO_DIR", "/app/"
@@ -39,6 +40,8 @@ BUNDLED_SCRIPTS = ("run_multi_evaluator.py",)
 
 app = Flask(__name__)
 sandbox_lock = threading.Lock()
+reset_controller: SandboxReset | None = None
+_maintenance_requested = threading.Event()
 
 # Configure logging
 log_handler = logging.StreamHandler()
@@ -54,21 +57,76 @@ logger = logging.getLogger(__name__)
 
 
 def lock_sandbox():
+  """Serialize execution and wrap both endpoints in the reset lifecycle.
+
+  begin() protects existing processes. Subprocess exits invoke early process
+  cleanup, then the handler collects results. finish() runs before the response
+  is returned, even on errors. Pending quarantine rejects reuse with 429;
+  retirement rejects it with 503 and uses the existing restart path.
+  """
+
   def decorator(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
       if not sandbox_lock.acquire(blocking=False):
-        logger.info(
-          "Experiment already running on sandbox. Rejecting new request."
-        )
+        logger.info("Experiment already running on sandbox. Rejecting new request.")
         return jsonify(
           {"output": None, "metainfo": "Only one experiment can run at a time."}
         ), 429
 
       try:
-        return f(*args, **kwargs)
+        if common_tools.is_contaminated():
+          return jsonify(
+            {"status": "failed", "error": "Sandbox requires replacement."}
+          ), 503
+        controller = reset_controller
+        if controller is None:
+          return f(*args, **kwargs)
+        if not controller.available:
+          if controller.reason:
+            common_tools.mark_contaminated()
+            return jsonify(
+              {"status": "failed", "error": "Sandbox requires replacement."}
+            ), 503
+          return jsonify(
+            {"output": None, "metainfo": "Sandbox cleanup is still in progress."}
+          ), 429
+        try:
+          controller.begin()
+        except ResetIncomplete:
+          common_tools.mark_contaminated()
+          return jsonify(
+            {"status": "failed", "error": "Sandbox requires replacement."}
+          ), 503
+        try:
+          # Attempt detached-process cleanup at subprocess exits, before the
+          # handler reads final Git diffs or checkpoint data.
+          with common_tools.command_cleanup(controller.stop_processes):
+            return f(*args, **kwargs)
+        finally:
+          # The handler has built its response (or raised). Hold the lock during
+          # restoration, before the HTTP response is sent.
+          try:
+            result = controller.finish()
+            logger.info(
+              "Sandbox reset: status=%s elapsed_ms=%.3f operations=%d "
+              "quarantine_items=%d reason=%s",
+              result.status,
+              result.elapsed_ms,
+              result.operations,
+              result.quarantine_items,
+              result.reason,
+            )
+          except Exception:
+            controller.retire("unexpected reset failure")
+            logger.exception("Sandbox reset failed")
+          if controller.reason:
+            common_tools.mark_contaminated()
       finally:
         sandbox_lock.release()
+        # Wake the maintenance worker after releasing the execution lock.
+        if reset_controller is not None and reset_controller.needs_maintenance:
+          _maintenance_requested.set()
 
     return decorated_function
 
@@ -77,18 +135,17 @@ def lock_sandbox():
 
 # How long to let the WSGI server flush the response before exiting.
 _RESTART_GRACE = 1.0
+_restart_scheduled = threading.Event()
 
 
 def _restart_container() -> None:
-  """Exit so the container restarts, discarding anything left running in it.
+  """Exit after cleanup failure so the container runtime can replace the sandbox.
 
-  The daemon is PID 1 in the sandbox container, so ending it ends the container's
-  PID namespace, taking any survivor with it, and the kubelet starts a
-  replacement.
+  Deployment must replace the writable filesystem and private PID namespace
+  when restarting the daemon.
   """
   logger.warning(
-    "A process survived this evaluation and is still running on the pod. "
-    "Restarting the container so it cannot affect later measurements."
+    "Sandbox cleanup was incomplete. Restarting the container before reuse."
   )
   # `os._exit` skips interpreter cleanup, which would join the abandoned readers.
   os._exit(1)
@@ -96,12 +153,104 @@ def _restart_container() -> None:
 
 @app.after_request
 def _restart_if_contaminated(response):
-  """Restart the container once a survivor makes its measurements unreliable."""
+  """Signal retirement and schedule exit when cleanup requires replacement."""
   if common_tools.is_contaminated():
-    # After the response: this evaluation ran on a clean pod, only later ones are
-    # at risk.
-    threading.Timer(_RESTART_GRACE, _restart_container).start()
+    # Preserve the current command's response while preventing subsequent reuse.
+    response.headers["X-Sandbox-Retired"] = "1"
+    _schedule_restart()
   return response
+
+
+def _schedule_restart():
+  if not _restart_scheduled.is_set():
+    _restart_scheduled.set()
+    threading.Timer(_RESTART_GRACE, _restart_container).start()
+
+
+def _maintain_sandbox():
+  """Resume quarantine deletion and spare preparation between requests.
+
+  The event wakes this worker when work is pending. Each maintain() call
+  advances a saved iterator under the execution lock, then releases the lock.
+  Maintenance failures mark the sandbox contaminated and schedule exit.
+  """
+  while True:
+    _maintenance_requested.wait()
+    _maintenance_requested.clear()
+    if not sandbox_lock.acquire(blocking=False):
+      # The active handler signals pending work again when releasing its lock.
+      continue
+    try:
+      reset_controller.maintain()
+      if reset_controller.reason:
+        common_tools.mark_contaminated()
+        _schedule_restart()
+        return
+    except Exception:
+      reset_controller.retire("unexpected maintenance failure")
+      common_tools.mark_contaminated()
+      logger.exception("Sandbox maintenance failed")
+      _schedule_restart()
+      return
+    finally:
+      sandbox_lock.release()
+    if reset_controller.needs_maintenance:
+      _maintenance_requested.set()
+
+
+def initialize_sandbox_reset():
+  """Capture the Linux sandbox baseline before starting the HTTP server.
+
+  Keep REPO_DIR under its existing restore/result workflow, exclude daemon Git
+  state and virtual infrastructure, and include /dev/shm as a managed subtree.
+  Preparation errors fail startup. __main__ calls this before serving requests;
+  route tests import the module with initialization left to the caller.
+  """
+  global reset_controller
+  if os.environ.get("SANDBOX_RESET_ENABLED", "1") == "0":
+    return
+  if not sys.platform.startswith("linux"):
+    logger.warning("Sandbox filesystem reset requires Linux")
+    return
+  root = Path(os.environ.get("SANDBOX_RESET_ROOT", "/")).absolute()
+  state = Path(
+    os.environ.get("SANDBOX_RESET_STATE_DIR", str(root / "tmp/.daemon-reset"))
+  )
+  excluded = tuple(
+    Path(path).absolute()
+    for path in (
+      REPO_DIR,
+      TRACKING_GIT_DIR,
+      SCRATCH_TRACKING_GIT_DIR,
+      str(root / "proc"),
+      str(root / "sys"),
+      str(root / "dev"),
+    )
+  )
+  uid = os.environ.get("SANDBOX_EXECUTION_UID")
+  shared_memory = (root / "dev/shm").resolve()
+  controller = SandboxReset(
+    root,
+    state,
+    excluded=excluded,
+    process_uid=int(uid) if uid is not None else None,
+    additional_roots=(shared_memory,) if shared_memory.is_dir() else (),
+  )
+  try:
+    controller.prepare()
+  except Exception:
+    controller.close()
+    raise
+  reset_controller = controller
+  logger.info(
+    "Captured sandbox baseline: entries=%d bytes=%d notifications=%s",
+    len(controller.nodes),
+    controller.bytes_saved,
+    controller.notifications.complete,
+  )
+  threading.Thread(
+    target=_maintain_sandbox, daemon=True, name="sandbox-maintenance"
+  ).start()
 
 
 def _resolve_repo_path(
@@ -124,9 +273,7 @@ def _resolve_repo_path(
   return full_path
 
 
-def _apply_code_files(
-  code_files: dict[str, str | None], dir: str
-) -> None:
+def _apply_code_files(code_files: dict[str, str | None], dir: str) -> None:
   """Lay the request's files over the supplied directory, in order.
 
   Content writes the file, creating missing parent directories; None deletes
@@ -138,9 +285,7 @@ def _apply_code_files(
   for rel_path, content in code_files.items():
     try:
       if content is None:
-        full_path = _resolve_repo_path(
-          rel_path, dir, follow_final_symlink=False
-        )
+        full_path = _resolve_repo_path(rel_path, dir, follow_final_symlink=False)
         full_path.unlink(missing_ok=True)
         continue
       full_path = _resolve_repo_path(rel_path, dir)
@@ -202,9 +347,7 @@ def execute_python_function(
     )
     return output
   except common_tools.FunctionExecutionError as e:
-    logger.info(
-      "Run command failed: %s. Attempting to read checkpoint data.", e
-    )
+    logger.info("Run command failed: %s. Attempting to read checkpoint data.", e)
     try:
       # If the script leaves checkpointed json data, find and return it
       output = common_tools.run_command(["cat", "checkpoint.json"], REPO_DIR)
@@ -215,9 +358,7 @@ def execute_python_function(
         }
       ), 200
     except common_tools.FunctionExecutionError as ee:
-      logger.info(
-        "Failed to read checkpoint data: %s. Returning original error.", ee
-      )
+      logger.info("Failed to read checkpoint data: %s. Returning original error.", ee)
       # Re-raise the original error unchanged. `run_command` already produces
       # the final, user-facing message (including any "Execution failed:"
       # prefix), so it must not be wrapped again here.
@@ -227,6 +368,8 @@ def execute_python_function(
 @app.route("/health", methods=["GET"])
 def health_check():
   """Health check endpoint."""
+  if common_tools.is_contaminated():
+    return jsonify({"status": "unhealthy"}), 503
   return jsonify({"status": "healthy"}), 200
 
 
@@ -312,9 +455,7 @@ def get_changed_files(dir: str, git_dir: str):
   """Return a dict of {relative_path: content} for all files changed since init."""
   # This git command returns all untracked files and files with unstaged changes
   args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
-  result = subprocess.run(
-    _git(args, dir, git_dir), capture_output=True, text=True
-  )
+  result = subprocess.run(_git(args, dir, git_dir), capture_output=True, text=True)
   filenames = [name for name in result.stdout.split("\0") if name]
 
   files = {}
@@ -362,6 +503,7 @@ def execute_shell_command(
     encoding="utf-8",
     errors="replace",
     start_new_session=True,
+    **common_tools.execution_user(),
   )
   with common_tools.sandboxed_process(process):
     # Shell output is returned to the agent but kept out of the logs: a command
@@ -394,8 +536,7 @@ def execute_shell_command(
       parts.append(f"Exit code: {returncode}")
     if not drained:
       parts.append(
-        "[Output truncated: the command left background processes holding its "
-        "output.]"
+        "[Output truncated: the command left background processes holding its output.]"
       )
     output = "\n".join(parts) if parts else "(no output)"
 
@@ -431,8 +572,7 @@ def run_shell():
     with _scratch_workspace(data.get("scratch_files", {})):
       cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
       if not any(
-        cwd.is_relative_to(Path(root).resolve())
-        for root in (REPO_DIR, SCRATCH_DIR)
+        cwd.is_relative_to(Path(root).resolve()) for root in (REPO_DIR, SCRATCH_DIR)
       ):
         raise ValueError("cwd escapes workspace directories")
       output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
@@ -472,16 +612,16 @@ def materialize_shell_scripts() -> None:
       dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     logger.info("Materialized helper scripts into %s", SCRIPTS_DIR)
   except OSError as e:
-    logger.warning(
-      "Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e
-    )
+    logger.warning("Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e)
 
 
 if __name__ == "__main__":
   # Ensure required directories exist
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
+  os.makedirs(SCRATCH_DIR, exist_ok=True)
   materialize_shell_scripts()
+  initialize_sandbox_reset()
 
   port = int(os.environ.get("PORT", "8080"))
 

@@ -31,6 +31,9 @@ class _Response:
   Stand-in for the Flask response that `after_request` hooks receive and return.
   """
 
+  def __init__(self):
+    self.headers = {}
+
 
 class _MockTimer:
   """
@@ -174,17 +177,13 @@ class TestEvaluationArguments:
     assert target.read_text() == "target"
 
   @pytest.mark.parametrize("content", [None, "replacement"])
-  def test_rejects_code_file_paths_outside_repo(
-    self, content: str | None
-  ) -> None:
+  def test_rejects_code_file_paths_outside_repo(self, content: str | None) -> None:
     """Overlay writes and deletions cannot escape through parent traversal."""
     outside = self.repo.parent / "outside.txt"
     outside.write_text("keep me")
 
     with pytest.raises(ValueError, match="Path escapes repo directory"):
-      main.execute_python_function(
-        {"../outside.txt": content}, [], 30, "unused.py"
-      )
+      main.execute_python_function({"../outside.txt": content}, [], 30, "unused.py")
 
     assert outside.read_text() == "keep me"
 
@@ -199,9 +198,7 @@ class TestEvaluationArguments:
     (self.repo / "escape").symlink_to(outside_dir, target_is_directory=True)
 
     with pytest.raises(ValueError, match="Path escapes repo directory"):
-      main.execute_python_function(
-        {"escape/outside.txt": None}, [], 30, "unused.py"
-      )
+      main.execute_python_function({"escape/outside.txt": None}, [], 30, "unused.py")
 
     assert outside.read_text() == "keep me"
 
@@ -233,7 +230,6 @@ class TestEvaluationArguments:
       "status": "failed",
       "error": "Path escapes repo directory: ../outside.txt",
     }
-
 
   def test_creates_missing_directories_for_code_files(self) -> None:
     """
@@ -287,6 +283,7 @@ class TestEvaluationArguments:
     body = response.get_json()
     assert body["status"] == "failed"
     assert body["error"].startswith("Cannot write code file a_file/inside.txt:")
+
 
 class TestShellCommandDescendants:
   """
@@ -360,9 +357,7 @@ class TestShellCommandDescendants:
     outside.write_text("keep me")
 
     with pytest.raises(ValueError, match="Path escapes repo directory"):
-      main.execute_shell_command(
-        "true", str(self.repo), {"../outside.txt": None}, 30
-      )
+      main.execute_shell_command("true", str(self.repo), {"../outside.txt": None}, 30)
 
     assert outside.read_text() == "keep me"
 
@@ -420,9 +415,7 @@ class TestShellCommandDescendants:
     # then the timeout is reported and the backgrounded job was killed with it.
     assert output == "Error: command timed out after 1s"
     job_pid = int(pid_file.read_text())
-    assert wait_until_dead(job_pid), (
-      f"backgrounded job {job_pid} survived the timeout"
-    )
+    assert wait_until_dead(job_pid), f"backgrounded job {job_pid} survived the timeout"
 
   def test_reports_output_as_truncated_when_it_cannot_be_drained(
     self, tmp_path: pathlib.Path
@@ -440,10 +433,10 @@ class TestShellCommandDescendants:
       f"{sys.executable} -c "
       "'import subprocess, sys, os; "
       "child = subprocess.Popen("
-      "  [sys.executable, \"-c\", \"import time; time.sleep(30)\"], "
+      '  [sys.executable, "-c", "import time; time.sleep(30)"], '
       "  preexec_fn=os.setsid); "
       f'open("{pid_file}", "w").write(str(child.pid)); '
-      "print(\"partial output\")'"
+      'print("partial output")\''
     )
 
     # when it is run.
@@ -492,14 +485,18 @@ class TestShellCommandDescendants:
     # given a contaminated pod, and a stand-in for the timer so the exit never
     # runs here.
     restarts: list[float] = []
-    monkeypatch.setattr(main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts))
+    monkeypatch.setattr(
+      main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts)
+    )
     common_tools.mark_contaminated()
 
     # when a response goes out.
-    main._restart_if_contaminated(_Response())
+    response = _Response()
+    assert main._restart_if_contaminated(response) is response
 
     # then a restart was scheduled at the grace delay.
     assert restarts == [main._RESTART_GRACE]
+    assert response.headers["X-Sandbox-Retired"] == "1"
 
 
 class TestShellChangeTracking:
@@ -581,8 +578,7 @@ class TestShellChangeTracking:
     """
     # given an empty baseline.
     write_blob = (
-      f'{sys.executable} -c '
-      '\'open("blob.bin", "wb").write(b"\\xff\\xfe\\x00binary")\''
+      f'{sys.executable} -c \'open("blob.bin", "wb").write(b"\\xff\\xfe\\x00binary")\''
     )
     files = self._changed(f"{write_blob}; echo real > kept.txt")
 

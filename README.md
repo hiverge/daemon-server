@@ -43,7 +43,7 @@ The binary bundles:
 - requests library
 - psutil library
 - All Python standard library modules
-- Daemon server application code (main.py, common_tools.py)
+- Daemon server application code (main.py, common_tools.py, sandbox_reset.py)
 
 ## File Naming Convention
 
