@@ -27,8 +27,9 @@ BACKUP_DIR = os.environ.get(
   "BACKUP_DIR", "/shared/repo/"
 )  # Backup directory to restore original state
 TRACKING_GIT_DIR = os.environ.get(
-  "TRACKING_GIT_DIR", "/tmp/.agent_git"
-)  # Git directory for tracking changes without affecting the actual repo
+  "TRACKING_GIT_DIR", "/shared/daemon-state/git"
+)  # Prepared post-setup Git baseline, outside the temporary cleanup roots.
+REQUEST_TRACKING_GIT_DIR = f"{TRACKING_GIT_DIR}.request"
 SCRATCH_DIR = os.environ.get("SCRATCH_DIR", "/scratch")
 SCRATCH_TRACKING_GIT_DIR = f"{TRACKING_GIT_DIR}.scratch"
 # Where bundled helper scripts are exposed inside the sandbox/shell
@@ -70,9 +71,9 @@ _temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
 def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
   """Record immediate names in temporary roots before serving requests.
 
-  Setup directories are preserved as whole trees. Reserve the daemon's Git
-  tracking paths, which are created on the first shell call: their cached index
-  avoids re-hashing the repository on subsequent calls.
+  Setup directories are preserved as whole trees. Reserve configured Git paths
+  beneath these roots: the baseline survives requests, and request tracking
+  directories are removed by their owning contexts.
   """
   baseline = {}
   for directory in _TEMPORARY_DIRS:
@@ -81,7 +82,11 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
       info = root.stat()
       with os.scandir(root) as entries:
         names = {entry.name for entry in entries}
-      for tracking in (TRACKING_GIT_DIR, SCRATCH_TRACKING_GIT_DIR):
+      for tracking in (
+        TRACKING_GIT_DIR,
+        REQUEST_TRACKING_GIT_DIR,
+        SCRATCH_TRACKING_GIT_DIR,
+      ):
         tracking_path = Path(tracking).resolve()
         if tracking_path.is_relative_to(root):
           relative = tracking_path.relative_to(root)
@@ -238,7 +243,7 @@ def _scratch_workspace(files: dict[str, str]):
   root = Path(SCRATCH_DIR)
 
   def reset():
-    shutil.rmtree(SCRATCH_TRACKING_GIT_DIR, ignore_errors=True)
+    _remove_tracking_directory(SCRATCH_TRACKING_GIT_DIR)
     if root.is_dir() and not root.is_symlink():
       shutil.rmtree(root)
     else:
@@ -349,48 +354,99 @@ def run_function():
 
 
 def _git(args: list[str], dir: str, git_dir: str) -> list[str]:
-  """
-  Wrapper around git which uses an external git directory to track changes
-  without affecting the actual repo.
-  """
+  """Address the daemon's tracking repo separately from the project's .git."""
   return ["git", "--git-dir", git_dir, "--work-tree", dir] + args
 
 
+def _run_tracking_git(args: list[str], dir: str, git_dir: str):
+  """Run tracking Git with project ignore rules and a fixed configuration.
+
+  A shell can change global or system Git configuration. Tracking uses its own
+  repository configuration so those changes cannot carry into later requests.
+  """
+  env = os.environ.copy()
+  env["GIT_CONFIG_GLOBAL"] = "/dev/null"
+  env["GIT_CONFIG_SYSTEM"] = "/dev/null"
+  result = subprocess.run(
+    _git(args, dir, git_dir), capture_output=True, text=True, env=env
+  )
+  if result.returncode != 0:
+    raise RuntimeError(
+      f"Tracking git {args[0]} failed: {result.stderr.strip() or result.stdout.strip()}"
+    )
+  return result
+
+
+def _remove_tracking_directory(git_dir: str) -> None:
+  """Remove a tracking directory, including a replaced file or symlink."""
+  path = Path(git_dir)
+  if path.is_dir() and not path.is_symlink():
+    shutil.rmtree(path)
+  else:
+    path.unlink(missing_ok=True)
+
+
 def init_git_tracking(dir: str, git_dir: str):
-  """Initialize an external git tracking repo to capture workspace changes."""
-  shutil.rmtree(git_dir, ignore_errors=True)
+  """Create clean tracking metadata with no inherited hooks or exclude files."""
+  _remove_tracking_directory(git_dir)
+  _run_tracking_git(["init", "--template="], dir, git_dir)
 
-  commands = [
-    _git(["init"], dir, git_dir),
-    _git(["config", "user.email", "agent@docker"], dir, git_dir),
-    _git(["config", "user.name", "Agent"], dir, git_dir),
-  ]
 
-  for command in commands:
-    result = subprocess.run(command, capture_output=True, text=True)
-    if result.returncode != 0:
-      error_msg = result.stderr.strip() or result.stdout.strip()
-      raise RuntimeError(f"Failed to initialize git repository: {error_msg}")
+def prepare_git_tracking() -> None:
+  """Hash the post-setup work tree once, before accepting requests.
+
+  The index is prepared against REPO_DIR so it includes that tree's file
+  metadata. Each request copies this template and reads the existing blobs
+  through Git's object alternates. Request objects and index updates stay in
+  their own directory; tracking never updates this baseline after startup.
+  """
+  init_git_tracking(REPO_DIR, TRACKING_GIT_DIR)
+  # git add alone leaves no index when the setup work tree is empty.
+  _run_tracking_git(["read-tree", "--empty"], REPO_DIR, TRACKING_GIT_DIR)
+  snapshot_work_tree(REPO_DIR, TRACKING_GIT_DIR)
+
+
+@contextmanager
+def _request_git_tracking():
+  """Seed a fresh request repo from the startup index and share baseline blobs.
+
+  Copying the index reuses content hashes and the original stat information.
+  Git still validates the restored tree: overlays and files with changed
+  metadata can require content reads. New blobs are written into this request's
+  object store, which is removed on success, timeout, or failure.
+  """
+  baseline = Path(TRACKING_GIT_DIR)
+  tracking = Path(REQUEST_TRACKING_GIT_DIR)
+  _remove_tracking_directory(REQUEST_TRACKING_GIT_DIR)
+  try:
+    (tracking / "objects" / "info").mkdir(parents=True)
+    (tracking / "refs").mkdir()
+    for name in ("HEAD", "config", "index"):
+      shutil.copyfile(baseline / name, tracking / name)
+    # Git reads existing objects here and writes new objects under tracking.
+    (tracking / "objects" / "info" / "alternates").write_text(
+      f"{(baseline / 'objects').resolve()}\n", encoding="utf-8"
+    )
+    yield
+  finally:
+    _remove_tracking_directory(REQUEST_TRACKING_GIT_DIR)
 
 
 def snapshot_work_tree(dir: str, git_dir: str):
-  """Stage the pre-command state of the work tree in the tracking repo."""
-  if not (Path(git_dir) / "HEAD").exists():
-    init_git_tracking(dir, git_dir)
+  """Stage snapshot A, incorporating the request's files into its own index.
 
-  result = subprocess.run(
-    _git(["add", "-A"], dir, git_dir), capture_output=True, text=True
-  )
-  if result.returncode != 0:
-    error_msg = result.stderr.strip() or result.stdout.strip()
-    raise RuntimeError(f"Failed to stage changes: {error_msg}")
+  Git's full-tree metadata check preserves its handling of ignore rules,
+  symlinks, and deletions. This remains a repository-wide operation; copying
+  the startup index saves rebuilding its hashes from an empty index.
+  """
+  _run_tracking_git(["add", "-A"], dir, git_dir)
 
 
 def get_changed_files(dir: str, git_dir: str):
-  """Return a dict of {relative_path: content} for all files changed since init."""
+  """Return text changes relative to the pre-command index; None is a deletion."""
   # This git command returns all untracked files and files with unstaged changes
   args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
-  result = subprocess.run(_git(args, dir, git_dir), capture_output=True, text=True)
+  result = _run_tracking_git(args, dir, git_dir)
   filenames = [name for name in result.stdout.split("\0") if name]
 
   files = {}
@@ -404,6 +460,7 @@ def get_changed_files(dir: str, git_dir: str):
   return files
 
 
+@_request_git_tracking()
 def execute_shell_command(
   cmd: str,
   cwd: str,
@@ -420,7 +477,8 @@ def execute_shell_command(
 
   _apply_code_files(code_files, REPO_DIR)
 
-  snapshot_work_tree(REPO_DIR, TRACKING_GIT_DIR)
+  snapshot_work_tree(REPO_DIR, REQUEST_TRACKING_GIT_DIR)
+  init_git_tracking(SCRATCH_DIR, SCRATCH_TRACKING_GIT_DIR)
   snapshot_work_tree(SCRATCH_DIR, SCRATCH_TRACKING_GIT_DIR)
 
   # Run the shell command in its own process group, and time out on its own exit
@@ -474,7 +532,7 @@ def execute_shell_command(
       )
     output = "\n".join(parts) if parts else "(no output)"
 
-  return output, get_changed_files(REPO_DIR, TRACKING_GIT_DIR)
+  return output, get_changed_files(REPO_DIR, REQUEST_TRACKING_GIT_DIR)
 
 
 @app.route("/shell", methods=["POST"])
@@ -554,6 +612,7 @@ if __name__ == "__main__":
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
   materialize_shell_scripts()
+  prepare_git_tracking()
   _temporary_baseline = _capture_temporary_baseline()
 
   port = int(os.environ.get("PORT", "8080"))
