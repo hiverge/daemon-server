@@ -1,11 +1,13 @@
 """Tests for the main module."""
 
 import contextlib
+import errno
 import json
 import logging
 import os
 import pathlib
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -800,6 +802,7 @@ class TestTemporaryEntryCleanup:
     self.tracking = self.roots[0] / ".agent_git"
     monkeypatch.setattr(main, "_TEMPORARY_DIRS", self.roots)
     monkeypatch.setattr(main, "_temporary_baseline", {})
+    monkeypatch.setattr(main, "_temporary_events", None)
     monkeypatch.setattr(main, "REPO_DIR", f"{self.repo}/")
     monkeypatch.setattr(main, "BACKUP_DIR", f"{self.backup}/")
     monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(self.tracking))
@@ -807,12 +810,15 @@ class TestTemporaryEntryCleanup:
     monkeypatch.setattr(main, "SCRATCH_TRACKING_GIT_DIR", f"{self.tracking}.scratch")
     monkeypatch.setenv("PYTHON_EXECUTABLE", sys.executable)
     common_tools._contaminated.clear()
+    yield
+    if main._temporary_events is not None:
+      main._temporary_events.close()
 
   def _capture(self):
     main._temporary_baseline = main._capture_temporary_baseline()
 
   @pytest.mark.parametrize("root_index", [0, 1, 2])
-  def test_removes_additions_and_preserves_setup_trees(self, root_index, monkeypatch):
+  def test_removes_additions_and_preserves_setup_files(self, root_index):
     root = self.roots[root_index]
     kept = root / "setup.txt"
     kept.write_text("setup")
@@ -825,7 +831,7 @@ class TestTemporaryEntryCleanup:
     (root / "setup_link").symlink_to(outside, target_is_directory=True)
     self._capture()
 
-    # This layer preserves baseline names and entire baseline directory trees.
+    # Setup file contents are retained; new names inside setup trees are removed.
     kept.write_text("modified")
     (setup / "new.txt").write_text("inside setup tree")
     (root / "new.log").write_text("new")
@@ -836,18 +842,6 @@ class TestTemporaryEntryCleanup:
     (root / "new_link").symlink_to(outside, target_is_directory=True)
     (root / "broken_link").symlink_to(root / "missing")
 
-    # Traversing setup trees would make cleanup depend on their source size.
-    setup_info = setup.stat()
-    real_scandir = os.scandir
-
-    def scandir_without_setup_tree(path):
-      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
-      assert (info.st_dev, info.st_ino) != (setup_info.st_dev, setup_info.st_ino), (
-        "Cleanup traversed a setup directory."
-      )
-      return real_scandir(path)
-
-    monkeypatch.setattr(main.os, "scandir", scandir_without_setup_tree)
     main._cleanup_temporary_entries()
 
     assert {entry.name for entry in root.iterdir()} == {
@@ -856,7 +850,8 @@ class TestTemporaryEntryCleanup:
       "setup_link",
     }
     assert kept.read_text() == "modified"
-    assert (setup / "new.txt").read_text() == "inside setup tree"
+    assert (setup / "source.py").read_text() == "setup"
+    assert not (setup / "new.txt").exists()
     assert (root / "setup_link").is_symlink()
     assert (outside / "keep.txt").read_text() == "keep"
 
@@ -907,6 +902,11 @@ class TestTemporaryEntryCleanup:
     assert protected.read_text() == "keep"
     assert not (self.roots[1] / "new.log").exists()
     assert caplog.records
+    if sys.platform == "linux":
+      assert main._temporary_events.fd is not None
+    (self.roots[1] / "later.log").write_text("remove after watch loss")
+    main._cleanup_temporary_entries()
+    assert not (self.roots[1] / "later.log").exists()
 
   def test_logs_removal_failure_and_continues(self, monkeypatch, caplog):
     self._capture()
@@ -928,15 +928,22 @@ class TestTemporaryEntryCleanup:
     assert blocked.exists()
     assert not removable.exists()
     assert "Could not remove temporary entry" in caplog.text
+    monkeypatch.setattr(main.os, "unlink", real_unlink)
+    main._cleanup_temporary_entries()
+    assert not blocked.exists()
 
   @pytest.mark.parametrize("route", ["/shell", "/run_code"])
   @pytest.mark.parametrize("exit_code", [0, 7])
   def test_cleans_after_execution_and_preserves_response(self, route, exit_code):
+    nested = self.roots[0] / "setup_cache" / "nested"
+    nested.mkdir(parents=True)
     self._capture()
     artifact = self.roots[0] / "probe.log"
+    nested_artifact = nested / "probe.log"
     script = (
       "from pathlib import Path\n"
       f"Path({str(artifact)!r}).write_text('created')\n"
+      f"Path({str(nested_artifact)!r}).write_text('created')\n"
       "print('completed')\n"
       f"raise SystemExit({exit_code})\n"
     )
@@ -959,12 +966,14 @@ class TestTemporaryEntryCleanup:
     assert response.status_code == expected_status
     assert "completed" in response.get_data(as_text=True)
     assert not artifact.exists()
+    assert not nested_artifact.exists()
     if route == "/shell":
       tracking_inode = self.tracking.stat().st_ino
       response = client.post(route, json=payload)
       assert response.status_code == expected_status
       assert self.tracking.stat().st_ino == tracking_inode
       assert not artifact.exists()
+      assert not nested_artifact.exists()
 
   def test_cleans_on_handler_exception_before_unlocking(self, monkeypatch):
     self._capture()
@@ -987,3 +996,350 @@ class TestTemporaryEntryCleanup:
 
     assert not artifact.exists()
     assert not main.sandbox_lock.locked()
+
+  def test_excludes_workspace_backup_and_git_trees(self, monkeypatch):
+    protected = (
+      self.roots[0] / "workspace",
+      self.roots[0] / "backup",
+      self.tracking,
+      pathlib.Path(main.REQUEST_TRACKING_GIT_DIR),
+      pathlib.Path(main.SCRATCH_TRACKING_GIT_DIR),
+    )
+    for path in protected:
+      path.mkdir()
+      (path / "nested").mkdir()
+    monkeypatch.setattr(main, "REPO_DIR", str(protected[0]))
+    monkeypatch.setattr(main, "BACKUP_DIR", str(protected[1]))
+    identities = {(path.stat().st_dev, path.stat().st_ino) for path in protected}
+    real_scandir = os.scandir
+
+    def avoid_protected_trees(path):
+      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+      assert (info.st_dev, info.st_ino) not in identities
+      return real_scandir(path)
+
+    monkeypatch.setattr(main.os, "scandir", avoid_protected_trees)
+    self._capture()
+    for path in protected:
+      (path / "nested" / "new.txt").write_text("preserved")
+    (self.roots[0] / "probe.log").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    for path in protected:
+      assert (path / "nested" / "new.txt").read_text() == "preserved"
+    assert not (self.roots[0] / "probe.log").exists()
+
+  def test_blocks_symlinked_ancestor_even_when_leaf_inode_matches(self):
+    setup = self.roots[0] / "setup"
+    leaf = setup / "leaf"
+    leaf.mkdir(parents=True)
+    self._capture()
+    leaf.rename(self.repo / "leaf")
+    setup.rmdir()
+    setup.symlink_to(self.repo, target_is_directory=True)
+    protected = self.repo / "leaf" / "new.txt"
+    protected.write_text("preserved")
+
+    main._cleanup_temporary_entries()
+
+    assert protected.read_text() == "preserved"
+
+  def test_falls_back_when_event_tracking_is_unavailable(self, monkeypatch):
+    nested = self.roots[0] / "cache" / "nested"
+    nested.mkdir(parents=True)
+    monkeypatch.setattr(
+      main._TemporaryDirectoryEvents, "open", classmethod(lambda cls: None)
+    )
+    self._capture()
+    (nested / "probe.log").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    assert not (nested / "probe.log").exists()
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_scans_only_event_dirty_directories(self, monkeypatch):
+    changed = self.roots[0] / "cache" / "nested"
+    quiet = self.roots[0] / "untouched_source"
+    changed.mkdir(parents=True)
+    quiet.mkdir()
+    (quiet / "source.py").write_text("preserved")
+    self._capture()
+    assert main._temporary_events.fd is not None
+    changed_info = changed.stat()
+    real_scandir = os.scandir
+    scanned = []
+
+    def only_changed_directory(path):
+      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+      identity = (info.st_dev, info.st_ino)
+      assert identity == (changed_info.st_dev, changed_info.st_ino)
+      scanned.append(identity)
+      return real_scandir(path)
+
+    monkeypatch.setattr(main.os, "scandir", only_changed_directory)
+    main._cleanup_temporary_entries()
+    assert scanned == []
+    (changed / "probe.log").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    assert not (changed / "probe.log").exists()
+    assert len(scanned) == 1
+    scanned.clear()
+    main._cleanup_temporary_entries()
+    assert scanned == []
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_detects_tree_renamed_into_setup_directory(self):
+    setup = self.roots[0] / "cache"
+    setup.mkdir()
+    self._capture()
+    incoming = self.repo / "incoming"
+    (incoming / "nested").mkdir(parents=True)
+    (incoming / "nested" / "result").write_text("remove")
+    incoming.rename(setup / "incoming")
+
+    main._cleanup_temporary_entries()
+
+    assert not (setup / "incoming").exists()
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_deleted_setup_tree_keeps_other_watches_and_quiet_calls_idle(
+    self, monkeypatch
+  ):
+    removed = self.roots[0] / "setup_cache"
+    (removed / "nested").mkdir(parents=True)
+    quiet = self.roots[1] / "quiet"
+    quiet.mkdir()
+    self._capture()
+    baseline = main._temporary_baseline
+    events = main._temporary_events
+    original_fd = events.fd
+    quiet_watch = next(wd for wd, path in events.paths.items() if path == quiet)
+    shutil.rmtree(removed)
+    (quiet / "probe.log").write_text("remove during recovery")
+
+    main._cleanup_temporary_entries()
+
+    assert events.fd == original_fd
+    assert events.paths[quiet_watch] == quiet
+    assert main._temporary_baseline is baseline
+    assert not (quiet / "probe.log").exists()
+    real_open = main._open_temporary_directory
+
+    def no_directory_work(*args, **kwargs):
+      pytest.fail("An idle call revisited setup directories after watch recovery.")
+
+    monkeypatch.setattr(main, "_open_temporary_directory", no_directory_work)
+    main._cleanup_temporary_entries()
+    monkeypatch.setattr(main, "_open_temporary_directory", real_open)
+    (quiet / "next.log").write_text("remove using the surviving watch")
+    main._cleanup_temporary_entries()
+    assert not (quiet / "next.log").exists()
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_moved_setup_tree_returns_to_original_baseline(self):
+    setup = self.roots[0] / "cache"
+    nested = setup / "nested"
+    nested.mkdir(parents=True)
+    (nested / "setup.txt").write_text("preserved")
+    self._capture()
+    events = main._temporary_events
+    original_fd = events.fd
+    moved = self.repo / "moved_cache"
+    setup.rename(moved)
+    artifact = moved / "nested" / "probe.log"
+    artifact.write_text("created while displaced")
+
+    main._cleanup_temporary_entries()
+
+    assert events.fd == original_fd
+    assert artifact.exists()
+    moved.rename(setup)
+    main._cleanup_temporary_entries()
+    assert events.fd == original_fd
+    assert (nested / "setup.txt").read_text() == "preserved"
+    assert not (nested / "probe.log").exists()
+    (nested / "next.log").write_text("remove after returning")
+    main._cleanup_temporary_entries()
+    assert not (nested / "next.log").exists()
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_ignored_watch_is_rearmed_without_accepting_new_entries(self):
+    setup = self.roots[0] / "cache"
+    setup.mkdir()
+    (setup / "setup.txt").write_text("preserved")
+    self._capture()
+    events = main._temporary_events
+    original_fd = events.fd
+    descriptor = next(wd for wd, path in events.paths.items() if path == setup)
+    libc = main.ctypes.CDLL(None, use_errno=True)
+    libc.inotify_rm_watch.argtypes = [main.ctypes.c_int, main.ctypes.c_int]
+    libc.inotify_rm_watch.restype = main.ctypes.c_int
+    assert libc.inotify_rm_watch(events.fd, descriptor) == 0
+    (setup / "probe.log").write_text("created without a watch")
+
+    main._cleanup_temporary_entries()
+
+    assert events.fd == original_fd
+    assert setup in events.paths.values()
+    assert (setup / "setup.txt").read_text() == "preserved"
+    assert not (setup / "probe.log").exists()
+    assert "probe.log" not in main._temporary_baseline[setup].entries
+    (setup / "next.log").write_text("remove using recovered watch")
+    main._cleanup_temporary_entries()
+    assert not (setup / "next.log").exists()
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_recovery_watch_failure_keeps_scan_cleanup_available(
+    self, monkeypatch, caplog
+  ):
+    setup = self.roots[0] / "cache"
+    setup.mkdir()
+    self._capture()
+    setup.rmdir()
+    (self.roots[1] / "probe.log").write_text("remove despite recovery failure")
+
+    def failed_watch(events, path, directory_fd):
+      raise OSError(errno.ENOSPC, "No watches available")
+
+    monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", failed_watch)
+    with caplog.at_level(logging.WARNING):
+      main._cleanup_temporary_entries()
+
+    assert main._temporary_events.fd is None
+    assert not (self.roots[1] / "probe.log").exists()
+    assert "Could not recover temporary directory watch" in caplog.text
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_overflow_scans_all_directories_then_resumes_events(
+    self, monkeypatch, caplog
+  ):
+    quiet = self.roots[0] / "quiet"
+    quiet.mkdir()
+    self._capture()
+    events = main._temporary_events
+    (self.roots[1] / "probe.log").write_text("remove")
+    (quiet / "probe.log").write_text("remove without its creation event")
+    real_read = os.read
+    real_scandir = os.scandir
+    scanned = []
+
+    def overflow_record(fd, count):
+      data = real_read(fd, count)
+      if fd == events.fd:
+        return main._IN_EVENT.pack(-1, main._IN_Q_OVERFLOW, 0, 0)
+      return data
+
+    def record_scans(path):
+      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+      scanned.append((info.st_dev, info.st_ino))
+      return real_scandir(path)
+
+    monkeypatch.setattr(main.os, "read", overflow_record)
+    monkeypatch.setattr(main.os, "scandir", record_scans)
+    with caplog.at_level(logging.WARNING):
+      main._cleanup_temporary_entries()
+
+    assert not (self.roots[1] / "probe.log").exists()
+    assert not (quiet / "probe.log").exists()
+    assert (quiet.stat().st_dev, quiet.stat().st_ino) in scanned
+    assert "queue overflowed" in caplog.text
+    assert events.fd is not None
+    monkeypatch.setattr(main.os, "read", real_read)
+    scanned.clear()
+    main._cleanup_temporary_entries()
+    assert scanned == []
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_init_failure_keeps_nested_cleanup_available(self, monkeypatch, caplog):
+    nested = self.roots[0] / "cache" / "nested"
+    nested.mkdir(parents=True)
+
+    def unavailable_inotify(*args, **kwargs):
+      raise OSError(errno.ENOSYS, "Inotify is unavailable")
+
+    monkeypatch.setattr(main.ctypes, "CDLL", unavailable_inotify)
+    self._capture()
+    assert main._temporary_events is None
+    (nested / "probe.log").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    assert not (nested / "probe.log").exists()
+    assert "will use directory scans" in caplog.text
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_watch_failure_keeps_nested_cleanup_available(self, monkeypatch, caplog):
+    nested = self.roots[0] / "cache" / "nested"
+    nested.mkdir(parents=True)
+
+    def unavailable_watch(events, path, directory_fd):
+      if events.fd is not None:
+        raise OSError(errno.ENOSPC, "No watches available")
+
+    monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", unavailable_watch)
+    self._capture()
+    assert main._temporary_events.fd is None
+    (nested / "probe.log").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    assert not (nested / "probe.log").exists()
+    assert "Could not watch temporary directory" in caplog.text
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_read_failure_falls_back_to_nested_cleanup(self, monkeypatch, caplog):
+    nested = self.roots[0] / "cache" / "nested"
+    nested.mkdir(parents=True)
+    self._capture()
+    events = main._temporary_events
+    (nested / "probe.log").write_text("remove")
+    real_read = os.read
+
+    def failed_read(fd, count):
+      if fd == events.fd:
+        raise OSError(errno.EIO, "Event read failed")
+      return real_read(fd, count)
+
+    monkeypatch.setattr(main.os, "read", failed_read)
+    with caplog.at_level(logging.WARNING):
+      main._cleanup_temporary_entries()
+
+    assert not (nested / "probe.log").exists()
+    assert events.fd is None
+    assert "using directory scans" in caplog.text
+
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
+  def test_keeps_events_arriving_during_cleanup(self, monkeypatch):
+    setup = self.roots[0] / "cache"
+    setup.mkdir()
+    self._capture()
+    first = setup / "first.tmp"
+    late = setup / "late.tmp"
+    first.write_text("remove")
+    real_scandir = os.scandir
+    real_unlink = os.unlink
+
+    @contextlib.contextmanager
+    def snapshot_scandir(path):
+      with real_scandir(path) as entries:
+        snapshot = list(entries)
+      yield iter(snapshot)
+
+    def create_during_removal(path, **kwargs):
+      result = real_unlink(path, **kwargs)
+      if path == first.name:
+        late.write_text("created during cleanup")
+      return result
+
+    monkeypatch.setattr(main.os, "scandir", snapshot_scandir)
+    monkeypatch.setattr(main.os, "unlink", create_during_removal)
+    main._cleanup_temporary_entries()
+    assert late.exists()
+
+    main._cleanup_temporary_entries()
+
+    assert not late.exists()
