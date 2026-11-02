@@ -317,11 +317,7 @@ def _cleanup_temporary_entries() -> None:
     baseline = _temporary_baseline[root]
     try:
       with _open_temporary_directory(root, _temporary_baseline) as directory_fd:
-        if (
-          changed is None
-          and _temporary_events is not None
-          and _temporary_events.fd is not None
-        ):
+        if _temporary_events is not None and _temporary_events.fd is not None:
           # Identity checks above exclude replacements. Re-adding a live watch
           # keeps its descriptor; watch before scanning to cover later writes.
           try:
