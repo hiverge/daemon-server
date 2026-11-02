@@ -7,6 +7,7 @@ import os
 import pathlib
 import shlex
 import signal
+import subprocess
 import sys
 import time
 
@@ -23,8 +24,28 @@ def _scratch_directory(monkeypatch, tmp_path):
   monkeypatch.setattr(main, "SCRATCH_DIR", str(tmp_path / "scratch"))
   monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
   monkeypatch.setattr(
+    main, "REQUEST_TRACKING_GIT_DIR", str(tmp_path / ".agent_git.request")
+  )
+  monkeypatch.setattr(
     main, "SCRATCH_TRACKING_GIT_DIR", str(tmp_path / ".agent_git.scratch")
   )
+  execute = main.execute_shell_command
+  started = False
+
+  def execute_after_setup(*args, **kwargs):
+    nonlocal started
+    # Tests populate their setup backup after fixtures run. Model daemon startup
+    # immediately before the first shell execution, before applying any overlay.
+    if not started:
+      if not (pathlib.Path(main.TRACKING_GIT_DIR) / "index").exists():
+        subprocess.run(
+          ["rsync", "-a", "--delete", main.BACKUP_DIR, main.REPO_DIR], check=True
+        )
+        main.prepare_git_tracking()
+      started = True
+    return execute(*args, **kwargs)
+
+  monkeypatch.setattr(main, "execute_shell_command", execute_after_setup)
 
 
 class _Response:
@@ -77,7 +98,14 @@ class TestEvaluationArguments:
     # Stub the pre-run `rsync` restore: these tests are about what reaches
     # `sys.argv`, and rsync only exists in the sandbox image, not on every dev
     # machine. `run_command` uses `Popen`, so the evaluation itself still runs.
-    monkeypatch.setattr(main.subprocess, "run", lambda *a, **k: None)
+    run = subprocess.run
+
+    def without_restore(args, *other, **kwargs):
+      if args[0] == "rsync":
+        return subprocess.CompletedProcess(args, 0)
+      return run(args, *other, **kwargs)
+
+    monkeypatch.setattr(main.subprocess, "run", without_restore)
     self.repo = repo
 
   def _argv_for(self, args: list) -> list[str]:
@@ -496,14 +524,7 @@ class TestShellCommandDescendants:
 
 
 class TestShellChangeTracking:
-  """
-  Tests the tracking repo that reports what a shell command changed.
-
-  The repo lives for the pod, not for the call: re-creating it would force
-  `git add -A` to re-hash the whole work tree. These tests pin the behaviour the
-  surviving index has to keep -- the baseline is the restored work tree, not
-  whatever the previous call left behind.
-  """
+  """Report each command's changes using a fresh copy of the startup index."""
 
   @pytest.fixture(autouse=True)
   def _sandbox(
@@ -582,10 +603,7 @@ class TestShellChangeTracking:
     assert files == {"kept.txt": "real\n"}
 
   def test_changes_do_not_persist_into_the_next_call(self) -> None:
-    """
-    The surviving index tracks the restored work tree, so a call is never charged
-    for what the previous call did.
-    """
+    """Each request stages its restored tree against the fixed setup template."""
     # given a first call that edits one baseline file and deletes another.
     (self.backup / "edit.txt").write_text("before")
     (self.backup / "remove.txt").write_text("doomed")
@@ -599,6 +617,127 @@ class TestShellChangeTracking:
     # against the restored content rather than against the stale index entry.
     assert quiet == {}
     assert single == {"edit.txt": "third\n"}
+
+  def test_request_overlays_are_the_comparison_baseline(self):
+    """Different overlays on one worker each define their own snapshot A."""
+    (self.backup / "edit.txt").write_text("setup")
+
+    _, quiet = main.execute_shell_command(
+      "true", str(self.repo), {"edit.txt": "first"}, 30
+    )
+    _, changed = main.execute_shell_command(
+      "printf after > edit.txt", str(self.repo), {"edit.txt": "first"}, 30
+    )
+    _, next_quiet = main.execute_shell_command(
+      "true", str(self.repo), {"edit.txt": "second"}, 30
+    )
+
+    assert quiet == next_quiet == {}
+    assert changed == {"edit.txt": "after"}
+
+  def test_baseline_metadata_and_objects_do_not_change_between_requests(self):
+    """Only the request store receives overlay blobs and index updates."""
+    (self.backup / "edit.txt").write_text("setup")
+    assert self._changed("true") == {}
+
+    def baseline_files():
+      return {
+        path.relative_to(self.tracking): path.read_bytes()
+        for path in self.tracking.rglob("*")
+        if path.is_file()
+      }
+
+    prepared = baseline_files()
+    main.execute_shell_command(
+      "printf result > edit.txt", str(self.repo), {"edit.txt": "overlay"}, 30
+    )
+    assert self._changed("true") == {}
+
+    assert baseline_files() == prepared
+    assert not pathlib.Path(main.REQUEST_TRACKING_GIT_DIR).exists()
+
+  def test_request_reads_setup_blobs_from_the_baseline_object_store(self):
+    """A clean request resolves setup blobs without its own copies."""
+    (self.backup / "kept.txt").write_text("setup")
+    self._changed("true")
+    staged = main._run_tracking_git(
+      ["ls-files", "--stage", "--", "kept.txt"],
+      main.REPO_DIR,
+      main.TRACKING_GIT_DIR,
+    ).stdout
+    blob = staged.split()[1]
+    request_git = shlex.quote(main.REQUEST_TRACKING_GIT_DIR)
+    output, files = main.execute_shell_command(
+      f"git --git-dir {request_git} cat-file blob {blob}; "
+      f"git --git-dir {request_git} count-objects",
+      str(self.repo),
+      {},
+      30,
+    )
+
+    assert output.startswith("setup0 objects")
+    assert files == {}
+    assert not pathlib.Path(main.REQUEST_TRACKING_GIT_DIR).exists()
+
+  def test_tracking_excludes_and_index_flags_do_not_leak_to_the_next_request(self):
+    """Changes to a request's own Git policy are discarded with its metadata."""
+    (self.backup / "edit.txt").write_text("setup")
+    tracking = shlex.quote(main.REQUEST_TRACKING_GIT_DIR)
+    self._changed(
+      f"mkdir -p {tracking}/info; "
+      f"printf 'new.txt\\n' > {tracking}/info/exclude; "
+      f"git --git-dir {tracking} --work-tree {shlex.quote(str(self.repo))} "
+      "update-index --skip-worktree edit.txt"
+    )
+
+    changed = self._changed("printf changed > edit.txt; printf fresh > new.txt")
+
+    assert changed == {"edit.txt": "changed", "new.txt": "fresh"}
+
+  def test_global_git_configuration_does_not_control_tracking(
+    self, monkeypatch, tmp_path
+  ):
+    """Tracking policy is independent of configuration outside the workspace."""
+    excludes = tmp_path / "excludes"
+    excludes.write_text("new.txt\n")
+    config = tmp_path / "global-git-config"
+    config.write_text(f"[core]\n\texcludesFile = {excludes}\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
+
+    assert self._changed("printf fresh > new.txt") == {"new.txt": "fresh"}
+
+  @pytest.mark.parametrize(
+    ("cmd", "timeout"),
+    [("true", 30), ("exit 7", 30), ("sleep 30", 0.1)],
+  )
+  def test_http_request_discards_both_tracking_repositories(self, cmd, timeout):
+    """Success, command failure, and timeout all end the request's Git lifetime."""
+    response = main.app.test_client().post(
+      "/shell",
+      json={"cwd": ".", "cmd": cmd, "code_files": {}, "timeout": timeout},
+    )
+
+    assert response.status_code == 200
+    assert (self.tracking / "index").is_file()
+    assert not pathlib.Path(main.REQUEST_TRACKING_GIT_DIR).exists()
+    assert not pathlib.Path(main.SCRATCH_TRACKING_GIT_DIR).exists()
+
+  def test_tracking_failure_discards_request_state_and_next_call_recovers(self):
+    """A failed comparison cannot leave corrupt metadata for the next call."""
+    tracking = shlex.quote(main.REQUEST_TRACKING_GIT_DIR)
+    response = main.app.test_client().post(
+      "/shell",
+      json={
+        "cwd": ".",
+        "cmd": f"printf '[' > {tracking}/config",
+        "code_files": {},
+      },
+    )
+
+    assert response.status_code == 500
+    assert not pathlib.Path(main.REQUEST_TRACKING_GIT_DIR).exists()
+    assert not pathlib.Path(main.SCRATCH_TRACKING_GIT_DIR).exists()
+    assert self._changed("printf recovered > new.txt") == {"new.txt": "recovered"}
 
   def test_scratch_round_trip_and_worker_reuse(self):
     client = main.app.test_client()
@@ -664,6 +803,7 @@ class TestTemporaryEntryCleanup:
     monkeypatch.setattr(main, "REPO_DIR", f"{self.repo}/")
     monkeypatch.setattr(main, "BACKUP_DIR", f"{self.backup}/")
     monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(self.tracking))
+    monkeypatch.setattr(main, "REQUEST_TRACKING_GIT_DIR", f"{self.tracking}.request")
     monkeypatch.setattr(main, "SCRATCH_TRACKING_GIT_DIR", f"{self.tracking}.scratch")
     monkeypatch.setenv("PYTHON_EXECUTABLE", sys.executable)
     common_tools._contaminated.clear()
