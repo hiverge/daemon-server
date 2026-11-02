@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import signal
 import sys
 import time
@@ -174,17 +175,13 @@ class TestEvaluationArguments:
     assert target.read_text() == "target"
 
   @pytest.mark.parametrize("content", [None, "replacement"])
-  def test_rejects_code_file_paths_outside_repo(
-    self, content: str | None
-  ) -> None:
+  def test_rejects_code_file_paths_outside_repo(self, content: str | None) -> None:
     """Overlay writes and deletions cannot escape through parent traversal."""
     outside = self.repo.parent / "outside.txt"
     outside.write_text("keep me")
 
     with pytest.raises(ValueError, match="Path escapes repo directory"):
-      main.execute_python_function(
-        {"../outside.txt": content}, [], 30, "unused.py"
-      )
+      main.execute_python_function({"../outside.txt": content}, [], 30, "unused.py")
 
     assert outside.read_text() == "keep me"
 
@@ -199,9 +196,7 @@ class TestEvaluationArguments:
     (self.repo / "escape").symlink_to(outside_dir, target_is_directory=True)
 
     with pytest.raises(ValueError, match="Path escapes repo directory"):
-      main.execute_python_function(
-        {"escape/outside.txt": None}, [], 30, "unused.py"
-      )
+      main.execute_python_function({"escape/outside.txt": None}, [], 30, "unused.py")
 
     assert outside.read_text() == "keep me"
 
@@ -233,7 +228,6 @@ class TestEvaluationArguments:
       "status": "failed",
       "error": "Path escapes repo directory: ../outside.txt",
     }
-
 
   def test_creates_missing_directories_for_code_files(self) -> None:
     """
@@ -287,6 +281,7 @@ class TestEvaluationArguments:
     body = response.get_json()
     assert body["status"] == "failed"
     assert body["error"].startswith("Cannot write code file a_file/inside.txt:")
+
 
 class TestShellCommandDescendants:
   """
@@ -360,9 +355,7 @@ class TestShellCommandDescendants:
     outside.write_text("keep me")
 
     with pytest.raises(ValueError, match="Path escapes repo directory"):
-      main.execute_shell_command(
-        "true", str(self.repo), {"../outside.txt": None}, 30
-      )
+      main.execute_shell_command("true", str(self.repo), {"../outside.txt": None}, 30)
 
     assert outside.read_text() == "keep me"
 
@@ -420,9 +413,7 @@ class TestShellCommandDescendants:
     # then the timeout is reported and the backgrounded job was killed with it.
     assert output == "Error: command timed out after 1s"
     job_pid = int(pid_file.read_text())
-    assert wait_until_dead(job_pid), (
-      f"backgrounded job {job_pid} survived the timeout"
-    )
+    assert wait_until_dead(job_pid), f"backgrounded job {job_pid} survived the timeout"
 
   def test_reports_output_as_truncated_when_it_cannot_be_drained(
     self, tmp_path: pathlib.Path
@@ -440,10 +431,10 @@ class TestShellCommandDescendants:
       f"{sys.executable} -c "
       "'import subprocess, sys, os; "
       "child = subprocess.Popen("
-      "  [sys.executable, \"-c\", \"import time; time.sleep(30)\"], "
+      '  [sys.executable, "-c", "import time; time.sleep(30)"], '
       "  preexec_fn=os.setsid); "
       f'open("{pid_file}", "w").write(str(child.pid)); '
-      "print(\"partial output\")'"
+      'print("partial output")\''
     )
 
     # when it is run.
@@ -492,7 +483,9 @@ class TestShellCommandDescendants:
     # given a contaminated pod, and a stand-in for the timer so the exit never
     # runs here.
     restarts: list[float] = []
-    monkeypatch.setattr(main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts))
+    monkeypatch.setattr(
+      main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts)
+    )
     common_tools.mark_contaminated()
 
     # when a response goes out.
@@ -581,8 +574,7 @@ class TestShellChangeTracking:
     """
     # given an empty baseline.
     write_blob = (
-      f'{sys.executable} -c '
-      '\'open("blob.bin", "wb").write(b"\\xff\\xfe\\x00binary")\''
+      f'{sys.executable} -c \'open("blob.bin", "wb").write(b"\\xff\\xfe\\x00binary")\''
     )
     files = self._changed(f"{write_blob}; echo real > kept.txt")
 
@@ -652,3 +644,206 @@ class TestShellChangeTracking:
     assert response.get_json()["status"] == "failed"
     assert not (self.repo.parent / "outside.txt").exists()
     assert list(pathlib.Path(main.SCRATCH_DIR).iterdir()) == []
+
+
+class TestTemporaryEntryCleanup:
+  """Exercise cleanup in private roots, including both HTTP execution paths."""
+
+  @pytest.fixture(autouse=True)
+  def _sandbox(self, monkeypatch, tmp_path):
+    self.roots = tuple(tmp_path / name for name in ("tmp", "var_tmp", "shm"))
+    for root in self.roots:
+      root.mkdir()
+    self.repo = tmp_path / "repo"
+    self.backup = tmp_path / "backup"
+    self.repo.mkdir()
+    self.backup.mkdir()
+    self.tracking = self.roots[0] / ".agent_git"
+    monkeypatch.setattr(main, "_TEMPORARY_DIRS", self.roots)
+    monkeypatch.setattr(main, "_temporary_baseline", {})
+    monkeypatch.setattr(main, "REPO_DIR", f"{self.repo}/")
+    monkeypatch.setattr(main, "BACKUP_DIR", f"{self.backup}/")
+    monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(self.tracking))
+    monkeypatch.setattr(main, "SCRATCH_TRACKING_GIT_DIR", f"{self.tracking}.scratch")
+    monkeypatch.setenv("PYTHON_EXECUTABLE", sys.executable)
+    common_tools._contaminated.clear()
+
+  def _capture(self):
+    main._temporary_baseline = main._capture_temporary_baseline()
+
+  @pytest.mark.parametrize("root_index", [0, 1, 2])
+  def test_removes_additions_and_preserves_setup_trees(self, root_index, monkeypatch):
+    root = self.roots[root_index]
+    kept = root / "setup.txt"
+    kept.write_text("setup")
+    setup = root / "setup_tree"
+    setup.mkdir()
+    (setup / "source.py").write_text("setup")
+    outside = self.repo / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (root / "setup_link").symlink_to(outside, target_is_directory=True)
+    self._capture()
+
+    # This layer preserves baseline names and entire baseline directory trees.
+    kept.write_text("modified")
+    (setup / "new.txt").write_text("inside setup tree")
+    (root / "new.log").write_text("new")
+    new_tree = root / "new_tree"
+    (new_tree / "nested").mkdir(parents=True)
+    (new_tree / "nested" / "output").write_text("new")
+    (new_tree / "alias").symlink_to(outside, target_is_directory=True)
+    (root / "new_link").symlink_to(outside, target_is_directory=True)
+    (root / "broken_link").symlink_to(root / "missing")
+
+    # Traversing setup trees would make cleanup depend on their source size.
+    setup_info = setup.stat()
+    real_scandir = os.scandir
+
+    def scandir_without_setup_tree(path):
+      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+      assert (info.st_dev, info.st_ino) != (setup_info.st_dev, setup_info.st_ino), (
+        "Cleanup traversed a setup directory."
+      )
+      return real_scandir(path)
+
+    monkeypatch.setattr(main.os, "scandir", scandir_without_setup_tree)
+    main._cleanup_temporary_entries()
+
+    assert {entry.name for entry in root.iterdir()} == {
+      "setup.txt",
+      "setup_tree",
+      "setup_link",
+    }
+    assert kept.read_text() == "modified"
+    assert (setup / "new.txt").read_text() == "inside setup tree"
+    assert (root / "setup_link").is_symlink()
+    assert (outside / "keep.txt").read_text() == "keep"
+
+    (root / "next.log").write_text("next request")
+    main._cleanup_temporary_entries()
+    assert not (root / "next.log").exists()
+
+  def test_preserves_tracking_created_after_capture(self):
+    self._capture()
+    self.tracking.mkdir()
+    (self.tracking / "index").write_text("cached index")
+    (self.roots[0] / "probe.log").write_text("new")
+
+    main._cleanup_temporary_entries()
+
+    assert (self.tracking / "index").read_text() == "cached index"
+    assert not (self.roots[0] / "probe.log").exists()
+
+  def test_accepts_root_aliases_and_skips_absent_roots(self, monkeypatch):
+    alias = self.repo / "tmp_alias"
+    alias.symlink_to(self.roots[0], target_is_directory=True)
+    absent = self.repo / "absent"
+    monkeypatch.setattr(main, "_TEMPORARY_DIRS", (alias, absent))
+    self._capture()
+    (self.roots[0] / "new.log").write_text("new")
+
+    main._cleanup_temporary_entries()
+
+    assert not (self.roots[0] / "new.log").exists()
+    assert not absent.exists()
+
+  @pytest.mark.parametrize("replacement", ["symlink", "directory"])
+  def test_skips_roots_replaced_after_capture(self, replacement, caplog):
+    self._capture()
+    root = self.roots[0]
+    root.rename(root.with_name("old_tmp"))
+    if replacement == "symlink":
+      root.symlink_to(self.repo, target_is_directory=True)
+    else:
+      root.mkdir()
+    protected = root / "keep.txt"
+    protected.write_text("keep")
+    (self.roots[1] / "new.log").write_text("new")
+
+    with caplog.at_level(logging.WARNING):
+      main._cleanup_temporary_entries()
+
+    assert protected.read_text() == "keep"
+    assert not (self.roots[1] / "new.log").exists()
+    assert caplog.records
+
+  def test_logs_removal_failure_and_continues(self, monkeypatch, caplog):
+    self._capture()
+    blocked = self.roots[0] / "blocked"
+    blocked.write_text("keep")
+    removable = self.roots[0] / "removable"
+    removable.write_text("remove")
+    real_unlink = os.unlink
+
+    def deny_blocked(path, **kwargs):
+      if path == blocked.name:
+        raise PermissionError("removal denied")
+      return real_unlink(path, **kwargs)
+
+    monkeypatch.setattr(main.os, "unlink", deny_blocked)
+    with caplog.at_level(logging.WARNING):
+      main._cleanup_temporary_entries()
+
+    assert blocked.exists()
+    assert not removable.exists()
+    assert "Could not remove temporary entry" in caplog.text
+
+  @pytest.mark.parametrize("route", ["/shell", "/run_code"])
+  @pytest.mark.parametrize("exit_code", [0, 7])
+  def test_cleans_after_execution_and_preserves_response(self, route, exit_code):
+    self._capture()
+    artifact = self.roots[0] / "probe.log"
+    script = (
+      "from pathlib import Path\n"
+      f"Path({str(artifact)!r}).write_text('created')\n"
+      "print('completed')\n"
+      f"raise SystemExit({exit_code})\n"
+    )
+    if route == "/shell":
+      payload = {
+        "cmd": f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        "cwd": ".",
+        "code_files": {},
+      }
+    else:
+      payload = {
+        "code": {"probe.py": script},
+        "evaluation_script": "probe.py",
+        "timeout": 30,
+      }
+
+    client = main.app.test_client()
+    response = client.post(route, json=payload)
+    expected_status = 400 if route == "/run_code" and exit_code else 200
+    assert response.status_code == expected_status
+    assert "completed" in response.get_data(as_text=True)
+    assert not artifact.exists()
+    if route == "/shell":
+      tracking_inode = self.tracking.stat().st_ino
+      response = client.post(route, json=payload)
+      assert response.status_code == expected_status
+      assert self.tracking.stat().st_ino == tracking_inode
+      assert not artifact.exists()
+
+  def test_cleans_on_handler_exception_before_unlocking(self, monkeypatch):
+    self._capture()
+    artifact = self.roots[0] / "probe.log"
+    real_cleanup = main._cleanup_temporary_entries
+
+    def cleanup_while_locked():
+      assert main.sandbox_lock.locked()
+      real_cleanup()
+
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", cleanup_while_locked)
+
+    @main.lock_sandbox()
+    def failing_handler():
+      artifact.write_text("created")
+      raise RuntimeError("handler failed")
+
+    with pytest.raises(RuntimeError, match="handler failed"):
+      failing_handler()
+
+    assert not artifact.exists()
+    assert not main.sandbox_lock.locked()

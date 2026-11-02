@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 
@@ -53,14 +54,93 @@ logging.root.setLevel(logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _TemporaryDirectoryBaseline:
+  """The root inode and immediate entry names recorded after setup."""
+
+  identity: tuple[int, int]
+  entries: frozenset[str]
+
+
+_TEMPORARY_DIRS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
+# Populated once at startup. Importing this module leaves cleanup disabled.
+_temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
+
+
+def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
+  """Record immediate names in temporary roots before serving requests.
+
+  Setup directories are preserved as whole trees. Reserve the daemon's Git
+  tracking paths, which are created on the first shell call: their cached index
+  avoids re-hashing the repository on subsequent calls.
+  """
+  baseline = {}
+  for directory in _TEMPORARY_DIRS:
+    root = directory.resolve()
+    try:
+      info = root.stat()
+      with os.scandir(root) as entries:
+        names = {entry.name for entry in entries}
+      for tracking in (TRACKING_GIT_DIR, SCRATCH_TRACKING_GIT_DIR):
+        tracking_path = Path(tracking).resolve()
+        if tracking_path.is_relative_to(root):
+          relative = tracking_path.relative_to(root)
+          if relative.parts:
+            names.add(relative.parts[0])
+      baseline[root] = _TemporaryDirectoryBaseline(
+        (info.st_dev, info.st_ino), frozenset(names)
+      )
+    except FileNotFoundError:
+      # Some images have no /dev/shm; capture only roots present at startup.
+      continue
+    except OSError as exc:
+      logger.warning("Could not inventory temporary directory %s: %s", root, exc)
+  return baseline
+
+
+def _cleanup_temporary_entries() -> None:
+  """Delete names absent from the startup baseline, logging cleanup failures.
+
+  Only new directory trees are traversed. Changes inside setup directories and
+  overwrites of setup files remain in place. Directory-relative operations keep
+  deletion anchored to the opened root; symlinks are unlinked.
+  """
+  for root, baseline in _temporary_baseline.items():
+    try:
+      directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+      try:
+        info = os.fstat(directory_fd)
+        if (info.st_dev, info.st_ino) != baseline.identity:
+          logger.warning("Skipping cleanup of replaced temporary root %s.", root)
+          continue
+        with os.scandir(directory_fd) as entries:
+          for entry in entries:
+            if entry.name in baseline.entries:
+              continue
+            try:
+              if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.name, dir_fd=directory_fd)
+              else:
+                os.unlink(entry.name, dir_fd=directory_fd)
+            except FileNotFoundError:
+              # A writer may have removed its own temporary entry already.
+              continue
+            except OSError as exc:
+              logger.warning(
+                "Could not remove temporary entry %s: %s", root / entry.name, exc
+              )
+      finally:
+        os.close(directory_fd)
+    except OSError as exc:
+      logger.warning("Could not clean temporary directory %s: %s", root, exc)
+
+
 def lock_sandbox():
   def decorator(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
       if not sandbox_lock.acquire(blocking=False):
-        logger.info(
-          "Experiment already running on sandbox. Rejecting new request."
-        )
+        logger.info("Experiment already running on sandbox. Rejecting new request.")
         return jsonify(
           {"output": None, "metainfo": "Only one experiment can run at a time."}
         ), 429
@@ -68,7 +148,13 @@ def lock_sandbox():
       try:
         return f(*args, **kwargs)
       finally:
-        sandbox_lock.release()
+        # Handlers have collected their response and finished process cleanup.
+        # Keep the lock until temporary entries are removed so the next request
+        # cannot start while this request's filesystem cleanup is running.
+        try:
+          _cleanup_temporary_entries()
+        finally:
+          sandbox_lock.release()
 
     return decorated_function
 
@@ -124,9 +210,7 @@ def _resolve_repo_path(
   return full_path
 
 
-def _apply_code_files(
-  code_files: dict[str, str | None], dir: str
-) -> None:
+def _apply_code_files(code_files: dict[str, str | None], dir: str) -> None:
   """Lay the request's files over the supplied directory, in order.
 
   Content writes the file, creating missing parent directories; None deletes
@@ -138,9 +222,7 @@ def _apply_code_files(
   for rel_path, content in code_files.items():
     try:
       if content is None:
-        full_path = _resolve_repo_path(
-          rel_path, dir, follow_final_symlink=False
-        )
+        full_path = _resolve_repo_path(rel_path, dir, follow_final_symlink=False)
         full_path.unlink(missing_ok=True)
         continue
       full_path = _resolve_repo_path(rel_path, dir)
@@ -202,9 +284,7 @@ def execute_python_function(
     )
     return output
   except common_tools.FunctionExecutionError as e:
-    logger.info(
-      "Run command failed: %s. Attempting to read checkpoint data.", e
-    )
+    logger.info("Run command failed: %s. Attempting to read checkpoint data.", e)
     try:
       # If the script leaves checkpointed json data, find and return it
       output = common_tools.run_command(["cat", "checkpoint.json"], REPO_DIR)
@@ -215,9 +295,7 @@ def execute_python_function(
         }
       ), 200
     except common_tools.FunctionExecutionError as ee:
-      logger.info(
-        "Failed to read checkpoint data: %s. Returning original error.", ee
-      )
+      logger.info("Failed to read checkpoint data: %s. Returning original error.", ee)
       # Re-raise the original error unchanged. `run_command` already produces
       # the final, user-facing message (including any "Execution failed:"
       # prefix), so it must not be wrapped again here.
@@ -312,9 +390,7 @@ def get_changed_files(dir: str, git_dir: str):
   """Return a dict of {relative_path: content} for all files changed since init."""
   # This git command returns all untracked files and files with unstaged changes
   args = ["ls-files", "-z", "--modified", "--others", "--exclude-standard"]
-  result = subprocess.run(
-    _git(args, dir, git_dir), capture_output=True, text=True
-  )
+  result = subprocess.run(_git(args, dir, git_dir), capture_output=True, text=True)
   filenames = [name for name in result.stdout.split("\0") if name]
 
   files = {}
@@ -394,8 +470,7 @@ def execute_shell_command(
       parts.append(f"Exit code: {returncode}")
     if not drained:
       parts.append(
-        "[Output truncated: the command left background processes holding its "
-        "output.]"
+        "[Output truncated: the command left background processes holding its output.]"
       )
     output = "\n".join(parts) if parts else "(no output)"
 
@@ -431,8 +506,7 @@ def run_shell():
     with _scratch_workspace(data.get("scratch_files", {})):
       cwd = (Path(REPO_DIR) / data["cwd"]).resolve()
       if not any(
-        cwd.is_relative_to(Path(root).resolve())
-        for root in (REPO_DIR, SCRATCH_DIR)
+        cwd.is_relative_to(Path(root).resolve()) for root in (REPO_DIR, SCRATCH_DIR)
       ):
         raise ValueError("cwd escapes workspace directories")
       output, files = execute_shell_command(cmd, str(cwd), code_files, timeout)
@@ -472,9 +546,7 @@ def materialize_shell_scripts() -> None:
       dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     logger.info("Materialized helper scripts into %s", SCRIPTS_DIR)
   except OSError as e:
-    logger.warning(
-      "Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e
-    )
+    logger.warning("Could not materialize helper scripts into %s: %s", SCRIPTS_DIR, e)
 
 
 if __name__ == "__main__":
@@ -482,6 +554,7 @@ if __name__ == "__main__":
   os.makedirs(REPO_DIR, exist_ok=True)
   os.makedirs(BACKUP_DIR, exist_ok=True)
   materialize_shell_scripts()
+  _temporary_baseline = _capture_temporary_baseline()
 
   port = int(os.environ.get("PORT", "8080"))
 

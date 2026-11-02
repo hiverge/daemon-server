@@ -271,7 +271,7 @@ def run_command(
     env["LD_LIBRARY_PATH"] = orig
   else:
     env.pop("LD_LIBRARY_PATH", None)
-  # Also configure Python to use unbuffered output so we can stream the output 
+  # Also configure Python to use unbuffered output so we can stream the output
   env["PYTHONUNBUFFERED"] = "1"
 
   process = subprocess.Popen(
