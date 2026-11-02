@@ -91,11 +91,7 @@ class TestRunCommand:
     and a no-output placeholder for stdout.
     """
     # given a command that writes only to stderr then exits non-zero.
-    cmd = _python(
-      "import sys; "
-      "print('boom on stderr', file=sys.stderr); "
-      "sys.exit(1)"
-    )
+    cmd = _python("import sys; print('boom on stderr', file=sys.stderr); sys.exit(1)")
 
     # when it is run, then stderr carries the tail and stdout shows no output.
     with pytest.raises(common_tools.FunctionExecutionError) as exc_info:
