@@ -98,31 +98,25 @@ class _TemporaryDirectoryEvents:
     self.paths: dict[int, Path] = {}
 
   @classmethod
-  def open(cls) -> _TemporaryDirectoryEvents | None:
-    if sys.platform != "linux":
-      return None
-    try:
-      libc = ctypes.CDLL(None, use_errno=True)
-      libc.inotify_init1.argtypes = [ctypes.c_int]
-      libc.inotify_init1.restype = ctypes.c_int
-      libc.inotify_add_watch.argtypes = [
-        ctypes.c_int,
-        ctypes.c_char_p,
-        ctypes.c_uint32,
-      ]
-      libc.inotify_add_watch.restype = ctypes.c_int
-      fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-      if fd < 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error))
-      return cls(fd, libc.inotify_add_watch)
-    except (AttributeError, OSError) as exc:
-      logger.warning("Could not initialize temporary event tracking: %s", exc)
-      return None
+  def open(cls) -> _TemporaryDirectoryEvents:
+    """Open Linux event tracking; initialization errors abort daemon startup."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.inotify_init1.argtypes = [ctypes.c_int]
+    libc.inotify_init1.restype = ctypes.c_int
+    libc.inotify_add_watch.argtypes = [
+      ctypes.c_int,
+      ctypes.c_char_p,
+      ctypes.c_uint32,
+    ]
+    libc.inotify_add_watch.restype = ctypes.c_int
+    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+      error = ctypes.get_errno()
+      raise OSError(error, os.strerror(error))
+    return cls(fd, libc.inotify_add_watch)
 
   def watch(self, path: Path, directory_fd: int) -> None:
-    if self.fd is None:
-      return
+    """Register a startup watch on the already-opened directory."""
     # The proc fd link refers to the directory already opened without following
     # symlinks. Watching it avoids resolving a mutable path again.
     descriptor = self._add_watch(
@@ -230,41 +224,46 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
   backup trees and all Git tracking paths are excluded even when configured
   under a temporary root. Tracking contexts remove their request directories.
   Symlinked directories are retained as entries and are never traversed.
+  Absent temporary roots are allowed. Other initialization and inventory errors
+  propagate, closing the watcher before the daemon can serve requests.
   """
   global _temporary_events
   if _temporary_events is not None:
     _temporary_events.close()
-  _temporary_events = _TemporaryDirectoryEvents.open()
-  baseline = {}
-  excluded = {
-    Path(path).resolve()
-    for path in (
-      REPO_DIR,
-      BACKUP_DIR,
-      TRACKING_GIT_DIR,
-      REQUEST_TRACKING_GIT_DIR,
-      SCRATCH_TRACKING_GIT_DIR,
-    )
-  }
-  pending = [(directory.resolve(), None) for directory in _TEMPORARY_DIRS]
-  seen = set()
-  while pending:
-    path, parent = pending.pop()
-    if any(path.is_relative_to(protected) for protected in excluded):
-      continue
-    try:
+  _temporary_events = None
+  events = _TemporaryDirectoryEvents.open()
+  try:
+    baseline = {}
+    excluded = {
+      Path(path).resolve()
+      for path in (
+        REPO_DIR,
+        BACKUP_DIR,
+        TRACKING_GIT_DIR,
+        REQUEST_TRACKING_GIT_DIR,
+        SCRATCH_TRACKING_GIT_DIR,
+      )
+    }
+    pending = []
+    for directory in _TEMPORARY_DIRS:
+      try:
+        path = directory.resolve(strict=True)
+      except FileNotFoundError:
+        # Images may omit temporary roots such as /dev/shm.
+        continue
+      pending.append((path, None))
+    seen = set()
+    while pending:
+      path, parent = pending.pop()
+      if any(path.is_relative_to(protected) for protected in excluded):
+        continue
       with _open_temporary_directory(path, baseline, parent) as directory_fd:
         info = os.fstat(directory_fd)
         identity = (info.st_dev, info.st_ino)
         # Directory aliases and bind mounts can revisit an already indexed inode.
         if identity in seen:
           continue
-        if _temporary_events is not None:
-          try:
-            _temporary_events.watch(path, directory_fd)
-          except OSError as exc:
-            logger.warning("Could not watch temporary directory %s: %s", path, exc)
-            _temporary_events.close()
+        events.watch(path, directory_fd)
         names = set()
         children = []
         with os.scandir(directory_fd) as entries:
@@ -278,11 +277,11 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
         baseline[path] = _TemporaryDirectoryBaseline(identity, frozenset(names), parent)
         seen.add(identity)
         pending.extend((child, path) for child in children)
-    except FileNotFoundError:
-      # Some images have no /dev/shm; a setup writer can also remove a child.
-      continue
-    except OSError as exc:
-      logger.warning("Could not inventory temporary directory %s: %s", path, exc)
+  except BaseException:
+    # Release startup resources while preserving the original failure.
+    events.close()
+    raise
+  _temporary_events = events
   return baseline
 
 

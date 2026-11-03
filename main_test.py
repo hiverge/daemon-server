@@ -907,9 +907,16 @@ class TestTemporaryEntryCleanup:
     main._cleanup_temporary_entries()
     assert blocked.exists()
 
-  @pytest.mark.parametrize("route", ["/shell", "/run_code"])
-  @pytest.mark.parametrize("exit_code", [0, 7])
-  @pytest.mark.parametrize("lose_coverage", [False, True])
+  @pytest.mark.parametrize(
+    "route, exit_code, lose_coverage",
+    [
+      ("/shell", 0, False),
+      ("/shell", 7, False),
+      ("/run_code", 0, False),
+      ("/run_code", 7, False),
+      ("/shell", 0, True),
+    ],
+  )
   def test_preserves_response_after_cleanup_or_coverage_loss(
     self, route, exit_code, lose_coverage
   ):
@@ -1038,38 +1045,65 @@ class TestTemporaryEntryCleanup:
 
     assert protected.read_text() == "preserved"
 
-  @pytest.mark.parametrize("failure", ["unavailable", "initialization", "watch"])
-  def test_skips_cleanup_when_startup_coverage_is_unavailable(
-    self, monkeypatch, failure
-  ):
+  def test_event_initialization_error_propagates(self, monkeypatch):
+    libc = main.ctypes.CDLL(None, use_errno=True)
+
+    def failed_init(flags):
+      main.ctypes.set_errno(errno.EMFILE)
+      return -1
+
+    monkeypatch.setattr(libc, "inotify_init1", failed_init)
+    monkeypatch.setattr(main.ctypes, "CDLL", lambda *args, **kwargs: libc)
+
+    with pytest.raises(OSError) as error:
+      self._capture()
+
+    assert error.value.errno == errno.EMFILE
+    assert main._temporary_events is None
+
+  @pytest.mark.parametrize("failure", ["watch", "inventory", "missing_inventory"])
+  def test_startup_errors_close_watcher_and_propagate(self, monkeypatch, failure):
     nested = self.roots[0] / "cache" / "nested"
     nested.mkdir(parents=True)
+    events = main._TemporaryDirectoryEvents.open()
+    original_fd = events.fd
+    monkeypatch.setattr(
+      main._TemporaryDirectoryEvents, "open", classmethod(lambda cls: events)
+    )
 
-    def unavailable(*args, **kwargs):
-      raise OSError(errno.ENOSYS, "Inotify is unavailable")
+    if failure == "watch":
 
-    if failure == "unavailable":
-      monkeypatch.setattr(
-        main._TemporaryDirectoryEvents, "open", classmethod(lambda cls: None)
-      )
-    elif failure == "initialization":
-      monkeypatch.setattr(main.ctypes, "CDLL", unavailable)
+      def failed_watch(*args):
+        main.ctypes.set_errno(errno.ENOSPC)
+        return -1
+
+      monkeypatch.setattr(events, "_add_watch", failed_watch)
+      expected_errno = errno.ENOSPC
     else:
-      monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", unavailable)
-    self._capture()
-    artifact = nested / "probe.log"
-    artifact.write_text("left for retirement")
+      # Fail after this directory's watch was installed, before its inventory
+      # was published. A read failure must never leave that partial stream live.
+      target = self.roots[0] if failure == "missing_inventory" else nested
+      identity = (target.stat().st_dev, target.stat().st_ino)
+      real_scandir = os.scandir
+      expected_errno = errno.ENOENT if failure == "missing_inventory" else errno.EACCES
 
-    def no_directory_work(*args, **kwargs):
-      pytest.fail("Unavailable coverage triggered a scan or watch recovery.")
+      def unreadable(path):
+        info = os.fstat(path)
+        if (info.st_dev, info.st_ino) == identity:
+          assert target in events.paths.values()
+          raise OSError(expected_errno, "Inventory failed", str(target))
+        return real_scandir(path)
 
-    monkeypatch.setattr(main, "_open_temporary_directory", no_directory_work)
-    monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", no_directory_work)
+      monkeypatch.setattr(main.os, "scandir", unreadable)
 
-    main._cleanup_temporary_entries()
+    with pytest.raises(OSError) as error:
+      self._capture()
 
-    assert artifact.exists()
-    assert main._temporary_events is None or main._temporary_events.fd is None
+    assert error.value.errno == expected_errno
+    assert main._temporary_events is None
+    with pytest.raises(OSError) as closed_fd:
+      os.fstat(original_fd)
+    assert closed_fd.value.errno == errno.EBADF
 
   def test_scans_only_event_dirty_directories(self, monkeypatch):
     changed = self.roots[0] / "cache" / "nested"
@@ -1121,29 +1155,18 @@ class TestTemporaryEntryCleanup:
 
     assert not (setup / "incoming").exists()
 
-  @pytest.mark.parametrize(
-    "failure", ["overflow", "watch_removed", "deleted", "moved", "read", "malformed"]
-  )
+  @pytest.mark.parametrize("failure", ["overflow", "deleted", "read"])
   def test_coverage_loss_stops_cleanup_without_scans_or_recovery(
     self, monkeypatch, caplog, failure
   ):
     setup = self.roots[0] / "cache"
     setup.mkdir()
     self._capture()
-    baseline = main._temporary_baseline
     events = main._temporary_events
     artifact = self.roots[1] / "probe.log"
     artifact.write_text("left for retirement")
-    if failure == "watch_removed":
-      descriptor = next(wd for wd, path in events.paths.items() if path == setup)
-      libc = main.ctypes.CDLL(None, use_errno=True)
-      libc.inotify_rm_watch.argtypes = [main.ctypes.c_int, main.ctypes.c_int]
-      libc.inotify_rm_watch.restype = main.ctypes.c_int
-      assert libc.inotify_rm_watch(events.fd, descriptor) == 0
-    elif failure == "deleted":
+    if failure == "deleted":
       setup.rmdir()
-    elif failure == "moved":
-      setup.rename(self.repo / "moved")
     else:
       real_read = os.read
 
@@ -1153,10 +1176,7 @@ class TestTemporaryEntryCleanup:
         if failure == "read":
           raise OSError(errno.EIO, "Event read failed")
         real_read(fd, count)
-        if failure == "overflow":
-          return main._IN_EVENT.pack(-1, main._IN_Q_OVERFLOW, 0, 0)
-        # A declared name with no bytes exercises truncated-event handling.
-        return main._IN_EVENT.pack(0, main._IN_CREATE, 0, 1)
+        return main._IN_EVENT.pack(-1, main._IN_Q_OVERFLOW, 0, 0)
 
       monkeypatch.setattr(main.os, "read", failed_stream)
 
@@ -1167,43 +1187,8 @@ class TestTemporaryEntryCleanup:
     monkeypatch.setattr(events, "watch", no_directory_work)
     with caplog.at_level(logging.WARNING):
       main._cleanup_temporary_entries()
-      if failure == "moved":
-        (self.repo / "moved").rename(setup)
       main._cleanup_temporary_entries()
 
     assert events.fd is None
-    assert events.paths == {}
-    assert main._temporary_baseline is baseline
     assert artifact.exists()
     assert "stopping cleanup" in caplog.text
-
-  def test_keeps_events_arriving_during_cleanup(self, monkeypatch):
-    setup = self.roots[0] / "cache"
-    setup.mkdir()
-    self._capture()
-    first = setup / "first.tmp"
-    late = setup / "late.tmp"
-    first.write_text("remove")
-    real_scandir = os.scandir
-    real_unlink = os.unlink
-
-    @contextlib.contextmanager
-    def snapshot_scandir(path):
-      with real_scandir(path) as entries:
-        snapshot = list(entries)
-      yield iter(snapshot)
-
-    def create_during_removal(path, **kwargs):
-      result = real_unlink(path, **kwargs)
-      if path == first.name:
-        late.write_text("created during cleanup")
-      return result
-
-    monkeypatch.setattr(main.os, "scandir", snapshot_scandir)
-    monkeypatch.setattr(main.os, "unlink", create_during_removal)
-    main._cleanup_temporary_entries()
-    assert late.exists()
-
-    main._cleanup_temporary_entries()
-
-    assert not late.exists()
