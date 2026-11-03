@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -20,6 +21,123 @@ def _python(code: str) -> list[str]:
   Build a command that runs the given Python source in a subprocess.
   """
   return [sys.executable, "-c", code]
+
+
+class TestRequestProcessCleanup:
+  """Check process identity, ownership, and failure handling without signalling."""
+
+  @pytest.fixture(autouse=True)
+  def _clear_contamination(self):
+    common_tools._contaminated.clear()
+    yield
+    common_tools._contaminated.clear()
+
+  def test_preserves_existing_helpers_and_their_new_children(self, monkeypatch):
+    helper, child, worker, reused = (Mock(pid=pid) for pid in (100, 101, 102, 200))
+    before = {
+      100: common_tools._ChildProcess(helper, 1.0, os.getpid()),
+      200: common_tools._ChildProcess(Mock(pid=200), 1.0, os.getpid()),
+    }
+    monkeypatch.setattr(common_tools, "_descendant_processes", lambda: before)
+    scope = common_tools._RequestProcessCleanup()
+    after = {
+      100: common_tools._ChildProcess(helper, 1.0, os.getpid()),
+      101: common_tools._ChildProcess(child, 2.0, 100),
+      102: common_tools._ChildProcess(worker, 2.0, os.getpid()),
+      200: common_tools._ChildProcess(reused, 2.0, os.getpid()),
+    }
+    monkeypatch.setattr(common_tools, "_descendant_processes", lambda: after)
+
+    assert scope._targets(None) == [worker, reused]
+    assert scope._targets(102) == [reused]
+
+  def test_rescans_for_newly_adopted_grandchildren(self, monkeypatch):
+    parent, orphan = Mock(pid=100), Mock(pid=101)
+    snapshots = iter(
+      (
+        {},
+        {100: common_tools._ChildProcess(parent, 1.0, os.getpid())},
+        {101: common_tools._ChildProcess(orphan, 1.0, os.getpid())},
+        {},
+      )
+    )
+    monkeypatch.setattr(common_tools, "_descendant_processes", lambda: next(snapshots))
+    monkeypatch.setattr(
+      common_tools.psutil, "wait_procs", lambda targets, timeout: (targets, [])
+    )
+    scope = common_tools._RequestProcessCleanup()
+
+    scope.cleanup()
+
+    parent.kill.assert_called_once_with()
+    orphan.kill.assert_called_once_with()
+    assert not common_tools.is_contaminated()
+
+  def test_permission_failure_marks_contamination(self, monkeypatch, caplog):
+    worker, killable = Mock(pid=100), Mock(pid=101)
+    worker.kill.side_effect = common_tools.psutil.AccessDenied(100)
+    monkeypatch.setattr(common_tools, "_descendant_processes", lambda: {})
+    scope = common_tools._RequestProcessCleanup()
+    monkeypatch.setattr(
+      common_tools,
+      "_descendant_processes",
+      lambda: {
+        100: common_tools._ChildProcess(worker, 1.0, os.getpid()),
+        101: common_tools._ChildProcess(killable, 1.0, os.getpid()),
+      },
+    )
+    monkeypatch.setattr(
+      common_tools.psutil, "wait_procs", lambda targets, timeout: ([killable], [worker])
+    )
+
+    scope.cleanup()
+
+    assert common_tools.is_contaminated()
+    killable.kill.assert_called_once_with()
+    assert "Could not kill request process" in caplog.text
+
+  def test_scope_cleans_on_exception_and_restores_thread_state(self, monkeypatch):
+    previous, scope = Mock(), Mock()
+    monkeypatch.setattr(common_tools, "_subreaper_enabled", True)
+    monkeypatch.setattr(common_tools, "_RequestProcessCleanup", lambda: scope)
+    monkeypatch.setattr(
+      common_tools._request_processes, "cleanup", previous, raising=False
+    )
+
+    with pytest.raises(RuntimeError, match="handler failed"):
+      with common_tools.request_process_cleanup():
+        raise RuntimeError("handler failed")
+
+    scope.cleanup.assert_called_once_with()
+    assert common_tools._request_processes.cleanup is previous
+
+  def test_incomplete_baseline_skips_process_selection(self, monkeypatch, caplog):
+    monkeypatch.setattr(common_tools, "_subreaper_enabled", True)
+
+    def unreadable():
+      raise common_tools.psutil.AccessDenied(os.getpid())
+
+    monkeypatch.setattr(common_tools, "_descendant_processes", unreadable)
+    with common_tools.request_process_cleanup():
+      assert common_tools._request_processes.cleanup is None
+
+    assert common_tools.is_contaminated()
+    assert "Could not capture the request process baseline" in caplog.text
+
+  def test_unavailable_subreaper_keeps_group_cleanup_available(
+    self, monkeypatch, caplog
+  ):
+    monkeypatch.setattr(common_tools, "_subreaper_enabled", False)
+    monkeypatch.setattr(common_tools.sys, "platform", "linux")
+
+    def unavailable(*args, **kwargs):
+      raise OSError("Subreaper setting unavailable")
+
+    monkeypatch.setattr(common_tools.ctypes, "CDLL", unavailable)
+
+    assert not common_tools.enable_process_cleanup()
+    assert not common_tools._subreaper_enabled
+    assert "Could not enable detached-process cleanup" in caplog.text
 
 
 class TestRunCommand:

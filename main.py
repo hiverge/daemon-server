@@ -334,7 +334,8 @@ def lock_sandbox():
         ), 429
 
       try:
-        return f(*args, **kwargs)
+        with common_tools.request_process_cleanup():
+          return f(*args, **kwargs)
       finally:
         # Handlers have collected their response and finished process cleanup.
         # Keep the lock until temporary entries are removed so the next request
@@ -797,6 +798,7 @@ if __name__ == "__main__":
   materialize_shell_scripts()
   prepare_git_tracking()
   _temporary_baseline = _capture_temporary_baseline()
+  common_tools.enable_process_cleanup()
 
   port = int(os.environ.get("PORT", "8080"))
 
