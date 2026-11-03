@@ -86,17 +86,16 @@ _IN_WATCH_LOST = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_UNMOUNT | _IN_IGNORED
 class _TemporaryDirectoryEvents:
   """Collect changed setup directories through one nonblocking inotify fd.
 
-  Overflow or lost watches request a full reconciliation and watch recovery
-  against the original baseline. Event read or watch registration failures close
-  the fd and keep subsequent calls on directory scans. Events arriving during
-  reconciliation remain queued for the next call.
+  Watches are installed once during startup inventory. Lost coverage closes the
+  event stream; cleanup stops because directory scans cannot establish whether
+  setup file contents changed during the gap. Events arriving during ordinary
+  cleanup remain queued for the next drain.
   """
 
   def __init__(self, fd: int, add_watch):
     self.fd: int | None = fd
     self._add_watch = add_watch
     self.paths: dict[int, Path] = {}
-    self._retry: set[Path] = set()
 
   @classmethod
   def open(cls) -> _TemporaryDirectoryEvents | None:
@@ -118,7 +117,7 @@ class _TemporaryDirectoryEvents:
         raise OSError(error, os.strerror(error))
       return cls(fd, libc.inotify_add_watch)
     except (AttributeError, OSError) as exc:
-      logger.warning("Temporary cleanup will use directory scans: %s", exc)
+      logger.warning("Could not initialize temporary event tracking: %s", exc)
       return None
 
   def watch(self, path: Path, directory_fd: int) -> None:
@@ -137,10 +136,10 @@ class _TemporaryDirectoryEvents:
     self.paths[descriptor] = path
 
   def changed_paths(self) -> set[Path] | None:
-    """Return dirty paths, or None when every indexed directory needs a scan."""
+    """Return dirty paths, or None when event coverage is unreliable."""
     if self.fd is None:
       return None
-    dirty, self._retry = self._retry, set()
+    dirty = set()
     try:
       # FIONREAD supplies the actual queued byte count. One queue snapshot keeps
       # concurrent writers from extending this read loop indefinitely.
@@ -150,36 +149,29 @@ class _TemporaryDirectoryEvents:
         return dirty
       data = os.read(self.fd, queued[0])
       offset = 0
-      reconcile = False
       while offset < len(data):
         descriptor, mask, _cookie, length = _IN_EVENT.unpack_from(data, offset)
         offset += _IN_EVENT.size + length
         if offset > len(data):
           raise ValueError("Incomplete inotify event")
         if mask & _IN_Q_OVERFLOW:
-          logger.warning(
-            "Temporary event queue overflowed; scanning setup directories."
-          )
-          reconcile = True
+          logger.warning("Temporary event queue overflowed; stopping cleanup.")
+          self.close()
+          return None
         elif mask & _IN_WATCH_LOST:
-          # IN_IGNORED means the kernel removed this watch. A moved directory's
-          # watch remains live and can report its return to the setup path.
-          if mask & _IN_IGNORED:
-            self.paths.pop(descriptor, None)
-          reconcile = True
+          logger.warning(
+            "Temporary directory changed or its watch was lost: %s; stopping cleanup.",
+            self.paths.get(descriptor),
+          )
+          self.close()
+          return None
         elif descriptor in self.paths:
           dirty.add(self.paths[descriptor])
-      if reconcile:
-        return None
       return dirty
     except (OSError, ValueError, struct.error) as exc:
-      logger.warning("Temporary event tracking failed; using directory scans: %s", exc)
+      logger.warning("Temporary event tracking failed; stopping cleanup: %s", exc)
       self.close()
       return None
-
-  def retry(self, path: Path) -> None:
-    """Retry a failed removal even if the directory receives no further events."""
-    self._retry.add(path)
 
   def close(self) -> None:
     if self.fd is not None:
@@ -192,11 +184,6 @@ _TEMPORARY_DIRS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
 # Populated once at startup. Importing this module leaves cleanup disabled.
 _temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
 _temporary_events: _TemporaryDirectoryEvents | None = None
-
-
-def _setup_directory_unavailable(exc: OSError) -> bool:
-  """Identify missing or replaced setup paths, which cannot be reconciled."""
-  return exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ESTALE)
 
 
 @contextmanager
@@ -302,31 +289,21 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
 def _cleanup_temporary_entries() -> None:
   """Delete names absent from the startup baseline, logging cleanup failures.
 
-  Events select changed setup directories. Missing event coverage falls back to
-  reconciling all indexed directories and re-arming surviving setup watches.
-  Existing file contents are preserved. New directory trees are removed
-  recursively; symlinks are unlinked.
+  Events select changed setup directories. Unreliable coverage stops cleanup.
+  New trees are removed recursively and symlinks are unlinked; existing file
+  contents are left as written. Failed removals are logged without retrying.
   """
-  changed = _temporary_events.changed_paths() if _temporary_events is not None else None
-  paths = (
-    _temporary_baseline
-    if changed is None
-    else (path for path in changed if path in _temporary_baseline)
-  )
-  for root in paths:
+  if _temporary_events is None:
+    return
+  changed = _temporary_events.changed_paths()
+  if changed is None:
+    return
+  for root in changed:
+    if root not in _temporary_baseline:
+      continue
     baseline = _temporary_baseline[root]
     try:
       with _open_temporary_directory(root, _temporary_baseline) as directory_fd:
-        if _temporary_events is not None and _temporary_events.fd is not None:
-          # Identity checks above exclude replacements. Re-adding a live watch
-          # keeps its descriptor; watch before scanning to cover later writes.
-          try:
-            _temporary_events.watch(root, directory_fd)
-          except OSError as exc:
-            logger.warning(
-              "Could not recover temporary directory watch %s: %s", root, exc
-            )
-            _temporary_events.close()
         with os.scandir(directory_fd) as entries:
           for entry in entries:
             if entry.name in baseline.entries:
@@ -340,16 +317,10 @@ def _cleanup_temporary_entries() -> None:
               # A writer may have removed its own temporary entry already.
               continue
             except OSError as exc:
-              if _temporary_events is not None:
-                _temporary_events.retry(root)
               logger.warning(
                 "Could not remove temporary entry %s: %s", root / entry.name, exc
               )
     except OSError as exc:
-      # Missing or replaced setup directories are outside this layer's recovery.
-      # Their surviving watches can report a later return to the original path.
-      if _temporary_events is not None and not _setup_directory_unavailable(exc):
-        _temporary_events.retry(root)
       logger.warning("Could not clean temporary directory %s: %s", root, exc)
 
 

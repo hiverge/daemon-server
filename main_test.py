@@ -7,7 +7,6 @@ import logging
 import os
 import pathlib
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -787,6 +786,7 @@ class TestShellChangeTracking:
     assert list(pathlib.Path(main.SCRATCH_DIR).iterdir()) == []
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
 class TestTemporaryEntryCleanup:
   """Exercise cleanup in private roots, including both HTTP execution paths."""
 
@@ -883,32 +883,7 @@ class TestTemporaryEntryCleanup:
     assert not (self.roots[0] / "new.log").exists()
     assert not absent.exists()
 
-  @pytest.mark.parametrize("replacement", ["symlink", "directory"])
-  def test_skips_roots_replaced_after_capture(self, replacement, caplog):
-    self._capture()
-    root = self.roots[0]
-    root.rename(root.with_name("old_tmp"))
-    if replacement == "symlink":
-      root.symlink_to(self.repo, target_is_directory=True)
-    else:
-      root.mkdir()
-    protected = root / "keep.txt"
-    protected.write_text("keep")
-    (self.roots[1] / "new.log").write_text("new")
-
-    with caplog.at_level(logging.WARNING):
-      main._cleanup_temporary_entries()
-
-    assert protected.read_text() == "keep"
-    assert not (self.roots[1] / "new.log").exists()
-    assert caplog.records
-    if sys.platform == "linux":
-      assert main._temporary_events.fd is not None
-    (self.roots[1] / "later.log").write_text("remove after watch loss")
-    main._cleanup_temporary_entries()
-    assert not (self.roots[1] / "later.log").exists()
-
-  def test_logs_removal_failure_and_continues(self, monkeypatch, caplog):
+  def test_logs_removal_failure_without_queuing_retries(self, monkeypatch, caplog):
     self._capture()
     blocked = self.roots[0] / "blocked"
     blocked.write_text("keep")
@@ -930,20 +905,29 @@ class TestTemporaryEntryCleanup:
     assert "Could not remove temporary entry" in caplog.text
     monkeypatch.setattr(main.os, "unlink", real_unlink)
     main._cleanup_temporary_entries()
-    assert not blocked.exists()
+    assert blocked.exists()
 
   @pytest.mark.parametrize("route", ["/shell", "/run_code"])
   @pytest.mark.parametrize("exit_code", [0, 7])
-  def test_cleans_after_execution_and_preserves_response(self, route, exit_code):
+  @pytest.mark.parametrize("lose_coverage", [False, True])
+  def test_preserves_response_after_cleanup_or_coverage_loss(
+    self, route, exit_code, lose_coverage
+  ):
     nested = self.roots[0] / "setup_cache" / "nested"
     nested.mkdir(parents=True)
     self._capture()
     artifact = self.roots[0] / "probe.log"
     nested_artifact = nested / "probe.log"
+    move_directory = (
+      f"Path({str(nested)!r}).rename({str(self.repo / 'moved')!r})\n"
+      if lose_coverage
+      else ""
+    )
     script = (
       "from pathlib import Path\n"
       f"Path({str(artifact)!r}).write_text('created')\n"
       f"Path({str(nested_artifact)!r}).write_text('created')\n"
+      f"{move_directory}"
       "print('completed')\n"
       f"raise SystemExit({exit_code})\n"
     )
@@ -965,6 +949,12 @@ class TestTemporaryEntryCleanup:
     expected_status = 400 if route == "/run_code" and exit_code else 200
     assert response.status_code == expected_status
     assert "completed" in response.get_data(as_text=True)
+    assert not main.sandbox_lock.locked()
+    if lose_coverage:
+      assert main._temporary_events.fd is None
+      assert artifact.exists()
+      assert (self.repo / "moved" / "probe.log").exists()
+      return
     assert not artifact.exists()
     assert not nested_artifact.exists()
     if route == "/shell":
@@ -1030,7 +1020,7 @@ class TestTemporaryEntryCleanup:
       assert (path / "nested" / "new.txt").read_text() == "preserved"
     assert not (self.roots[0] / "probe.log").exists()
 
-  def test_blocks_symlinked_ancestor_even_when_leaf_inode_matches(self):
+  def test_blocks_symlinked_ancestor_even_when_leaf_inode_matches(self, monkeypatch):
     setup = self.roots[0] / "setup"
     leaf = setup / "leaf"
     leaf.mkdir(parents=True)
@@ -1040,25 +1030,47 @@ class TestTemporaryEntryCleanup:
     setup.symlink_to(self.repo, target_is_directory=True)
     protected = self.repo / "leaf" / "new.txt"
     protected.write_text("preserved")
+    # Select the original leaf directly to exercise identity checks even when
+    # its ancestor has changed since the event was collected.
+    monkeypatch.setattr(main._temporary_events, "changed_paths", lambda: {leaf})
 
     main._cleanup_temporary_entries()
 
     assert protected.read_text() == "preserved"
 
-  def test_falls_back_when_event_tracking_is_unavailable(self, monkeypatch):
+  @pytest.mark.parametrize("failure", ["unavailable", "initialization", "watch"])
+  def test_skips_cleanup_when_startup_coverage_is_unavailable(
+    self, monkeypatch, failure
+  ):
     nested = self.roots[0] / "cache" / "nested"
     nested.mkdir(parents=True)
-    monkeypatch.setattr(
-      main._TemporaryDirectoryEvents, "open", classmethod(lambda cls: None)
-    )
+
+    def unavailable(*args, **kwargs):
+      raise OSError(errno.ENOSYS, "Inotify is unavailable")
+
+    if failure == "unavailable":
+      monkeypatch.setattr(
+        main._TemporaryDirectoryEvents, "open", classmethod(lambda cls: None)
+      )
+    elif failure == "initialization":
+      monkeypatch.setattr(main.ctypes, "CDLL", unavailable)
+    else:
+      monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", unavailable)
     self._capture()
-    (nested / "probe.log").write_text("remove")
+    artifact = nested / "probe.log"
+    artifact.write_text("left for retirement")
+
+    def no_directory_work(*args, **kwargs):
+      pytest.fail("Unavailable coverage triggered a scan or watch recovery.")
+
+    monkeypatch.setattr(main, "_open_temporary_directory", no_directory_work)
+    monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", no_directory_work)
 
     main._cleanup_temporary_entries()
 
-    assert not (nested / "probe.log").exists()
+    assert artifact.exists()
+    assert main._temporary_events is None or main._temporary_events.fd is None
 
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
   def test_scans_only_event_dirty_directories(self, monkeypatch):
     changed = self.roots[0] / "cache" / "nested"
     quiet = self.roots[0] / "untouched_source"
@@ -1079,6 +1091,11 @@ class TestTemporaryEntryCleanup:
       return real_scandir(path)
 
     monkeypatch.setattr(main.os, "scandir", only_changed_directory)
+
+    def no_watch_recovery(*args, **kwargs):
+      pytest.fail("Cleanup registered a watch after startup.")
+
+    monkeypatch.setattr(main._temporary_events, "watch", no_watch_recovery)
     main._cleanup_temporary_entries()
     assert scanned == []
     (changed / "probe.log").write_text("remove")
@@ -1091,7 +1108,6 @@ class TestTemporaryEntryCleanup:
     main._cleanup_temporary_entries()
     assert scanned == []
 
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
   def test_detects_tree_renamed_into_setup_directory(self):
     setup = self.roots[0] / "cache"
     setup.mkdir()
@@ -1105,214 +1121,62 @@ class TestTemporaryEntryCleanup:
 
     assert not (setup / "incoming").exists()
 
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_deleted_setup_tree_keeps_other_watches_and_quiet_calls_idle(
-    self, monkeypatch
+  @pytest.mark.parametrize(
+    "failure", ["overflow", "watch_removed", "deleted", "moved", "read", "malformed"]
+  )
+  def test_coverage_loss_stops_cleanup_without_scans_or_recovery(
+    self, monkeypatch, caplog, failure
   ):
-    removed = self.roots[0] / "setup_cache"
-    (removed / "nested").mkdir(parents=True)
-    quiet = self.roots[1] / "quiet"
-    quiet.mkdir()
+    setup = self.roots[0] / "cache"
+    setup.mkdir()
     self._capture()
     baseline = main._temporary_baseline
     events = main._temporary_events
-    original_fd = events.fd
-    quiet_watch = next(wd for wd, path in events.paths.items() if path == quiet)
-    shutil.rmtree(removed)
-    (quiet / "probe.log").write_text("remove during recovery")
+    artifact = self.roots[1] / "probe.log"
+    artifact.write_text("left for retirement")
+    if failure == "watch_removed":
+      descriptor = next(wd for wd, path in events.paths.items() if path == setup)
+      libc = main.ctypes.CDLL(None, use_errno=True)
+      libc.inotify_rm_watch.argtypes = [main.ctypes.c_int, main.ctypes.c_int]
+      libc.inotify_rm_watch.restype = main.ctypes.c_int
+      assert libc.inotify_rm_watch(events.fd, descriptor) == 0
+    elif failure == "deleted":
+      setup.rmdir()
+    elif failure == "moved":
+      setup.rename(self.repo / "moved")
+    else:
+      real_read = os.read
 
-    main._cleanup_temporary_entries()
+      def failed_stream(fd, count):
+        if fd != events.fd:
+          return real_read(fd, count)
+        if failure == "read":
+          raise OSError(errno.EIO, "Event read failed")
+        real_read(fd, count)
+        if failure == "overflow":
+          return main._IN_EVENT.pack(-1, main._IN_Q_OVERFLOW, 0, 0)
+        # A declared name with no bytes exercises truncated-event handling.
+        return main._IN_EVENT.pack(0, main._IN_CREATE, 0, 1)
 
-    assert events.fd == original_fd
-    assert events.paths[quiet_watch] == quiet
-    assert main._temporary_baseline is baseline
-    assert not (quiet / "probe.log").exists()
-    real_open = main._open_temporary_directory
+      monkeypatch.setattr(main.os, "read", failed_stream)
 
     def no_directory_work(*args, **kwargs):
-      pytest.fail("An idle call revisited setup directories after watch recovery.")
+      pytest.fail("Lost coverage triggered a scan or watch recovery.")
 
     monkeypatch.setattr(main, "_open_temporary_directory", no_directory_work)
-    main._cleanup_temporary_entries()
-    monkeypatch.setattr(main, "_open_temporary_directory", real_open)
-    (quiet / "next.log").write_text("remove using the surviving watch")
-    main._cleanup_temporary_entries()
-    assert not (quiet / "next.log").exists()
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_moved_setup_tree_returns_to_original_baseline(self):
-    setup = self.roots[0] / "cache"
-    nested = setup / "nested"
-    nested.mkdir(parents=True)
-    (nested / "setup.txt").write_text("preserved")
-    self._capture()
-    events = main._temporary_events
-    original_fd = events.fd
-    moved = self.repo / "moved_cache"
-    setup.rename(moved)
-    artifact = moved / "nested" / "probe.log"
-    artifact.write_text("created while displaced")
-
-    main._cleanup_temporary_entries()
-
-    assert events.fd == original_fd
-    assert artifact.exists()
-    moved.rename(setup)
-    main._cleanup_temporary_entries()
-    assert events.fd == original_fd
-    assert (nested / "setup.txt").read_text() == "preserved"
-    assert not (nested / "probe.log").exists()
-    (nested / "next.log").write_text("remove after returning")
-    main._cleanup_temporary_entries()
-    assert not (nested / "next.log").exists()
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_ignored_watch_is_rearmed_without_accepting_new_entries(self):
-    setup = self.roots[0] / "cache"
-    setup.mkdir()
-    (setup / "setup.txt").write_text("preserved")
-    self._capture()
-    events = main._temporary_events
-    original_fd = events.fd
-    descriptor = next(wd for wd, path in events.paths.items() if path == setup)
-    libc = main.ctypes.CDLL(None, use_errno=True)
-    libc.inotify_rm_watch.argtypes = [main.ctypes.c_int, main.ctypes.c_int]
-    libc.inotify_rm_watch.restype = main.ctypes.c_int
-    assert libc.inotify_rm_watch(events.fd, descriptor) == 0
-    (setup / "probe.log").write_text("created without a watch")
-
-    main._cleanup_temporary_entries()
-
-    assert events.fd == original_fd
-    assert setup in events.paths.values()
-    assert (setup / "setup.txt").read_text() == "preserved"
-    assert not (setup / "probe.log").exists()
-    assert "probe.log" not in main._temporary_baseline[setup].entries
-    (setup / "next.log").write_text("remove using recovered watch")
-    main._cleanup_temporary_entries()
-    assert not (setup / "next.log").exists()
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_recovery_watch_failure_keeps_scan_cleanup_available(
-    self, monkeypatch, caplog
-  ):
-    setup = self.roots[0] / "cache"
-    setup.mkdir()
-    self._capture()
-    setup.rmdir()
-    (self.roots[1] / "probe.log").write_text("remove despite recovery failure")
-
-    def failed_watch(events, path, directory_fd):
-      raise OSError(errno.ENOSPC, "No watches available")
-
-    monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", failed_watch)
+    monkeypatch.setattr(events, "watch", no_directory_work)
     with caplog.at_level(logging.WARNING):
       main._cleanup_temporary_entries()
-
-    assert main._temporary_events.fd is None
-    assert not (self.roots[1] / "probe.log").exists()
-    assert "Could not recover temporary directory watch" in caplog.text
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_overflow_scans_all_directories_then_resumes_events(
-    self, monkeypatch, caplog
-  ):
-    quiet = self.roots[0] / "quiet"
-    quiet.mkdir()
-    self._capture()
-    events = main._temporary_events
-    (self.roots[1] / "probe.log").write_text("remove")
-    (quiet / "probe.log").write_text("remove without its creation event")
-    real_read = os.read
-    real_scandir = os.scandir
-    scanned = []
-
-    def overflow_record(fd, count):
-      data = real_read(fd, count)
-      if fd == events.fd:
-        return main._IN_EVENT.pack(-1, main._IN_Q_OVERFLOW, 0, 0)
-      return data
-
-    def record_scans(path):
-      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
-      scanned.append((info.st_dev, info.st_ino))
-      return real_scandir(path)
-
-    monkeypatch.setattr(main.os, "read", overflow_record)
-    monkeypatch.setattr(main.os, "scandir", record_scans)
-    with caplog.at_level(logging.WARNING):
+      if failure == "moved":
+        (self.repo / "moved").rename(setup)
       main._cleanup_temporary_entries()
 
-    assert not (self.roots[1] / "probe.log").exists()
-    assert not (quiet / "probe.log").exists()
-    assert (quiet.stat().st_dev, quiet.stat().st_ino) in scanned
-    assert "queue overflowed" in caplog.text
-    assert events.fd is not None
-    monkeypatch.setattr(main.os, "read", real_read)
-    scanned.clear()
-    main._cleanup_temporary_entries()
-    assert scanned == []
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_init_failure_keeps_nested_cleanup_available(self, monkeypatch, caplog):
-    nested = self.roots[0] / "cache" / "nested"
-    nested.mkdir(parents=True)
-
-    def unavailable_inotify(*args, **kwargs):
-      raise OSError(errno.ENOSYS, "Inotify is unavailable")
-
-    monkeypatch.setattr(main.ctypes, "CDLL", unavailable_inotify)
-    self._capture()
-    assert main._temporary_events is None
-    (nested / "probe.log").write_text("remove")
-
-    main._cleanup_temporary_entries()
-
-    assert not (nested / "probe.log").exists()
-    assert "will use directory scans" in caplog.text
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_watch_failure_keeps_nested_cleanup_available(self, monkeypatch, caplog):
-    nested = self.roots[0] / "cache" / "nested"
-    nested.mkdir(parents=True)
-
-    def unavailable_watch(events, path, directory_fd):
-      if events.fd is not None:
-        raise OSError(errno.ENOSPC, "No watches available")
-
-    monkeypatch.setattr(main._TemporaryDirectoryEvents, "watch", unavailable_watch)
-    self._capture()
-    assert main._temporary_events.fd is None
-    (nested / "probe.log").write_text("remove")
-
-    main._cleanup_temporary_entries()
-
-    assert not (nested / "probe.log").exists()
-    assert "Could not watch temporary directory" in caplog.text
-
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
-  def test_read_failure_falls_back_to_nested_cleanup(self, monkeypatch, caplog):
-    nested = self.roots[0] / "cache" / "nested"
-    nested.mkdir(parents=True)
-    self._capture()
-    events = main._temporary_events
-    (nested / "probe.log").write_text("remove")
-    real_read = os.read
-
-    def failed_read(fd, count):
-      if fd == events.fd:
-        raise OSError(errno.EIO, "Event read failed")
-      return real_read(fd, count)
-
-    monkeypatch.setattr(main.os, "read", failed_read)
-    with caplog.at_level(logging.WARNING):
-      main._cleanup_temporary_entries()
-
-    assert not (nested / "probe.log").exists()
     assert events.fd is None
-    assert "using directory scans" in caplog.text
+    assert events.paths == {}
+    assert main._temporary_baseline is baseline
+    assert artifact.exists()
+    assert "stopping cleanup" in caplog.text
 
-  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
   def test_keeps_events_arriving_during_cleanup(self, monkeypatch):
     setup = self.roots[0] / "cache"
     setup.mkdir()
