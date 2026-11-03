@@ -3,12 +3,18 @@
 # Needed for Python 3.8 type hint compatibility
 from __future__ import annotations
 
+import array
+import ctypes
+import errno
+import fcntl
 import logging
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import termios
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -57,67 +63,246 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _TemporaryDirectoryBaseline:
-  """The root inode and immediate entry names recorded after setup."""
+  """A setup directory's inode, immediate names, and indexed parent."""
 
   identity: tuple[int, int]
   entries: frozenset[str]
+  parent: Path | None = None
+
+
+# Event bits and record layout from Linux UAPI's <linux/inotify.h>.
+_IN_MOVED_TO = 0x00000080
+_IN_CREATE = 0x00000100
+_IN_DELETE_SELF = 0x00000400
+_IN_MOVE_SELF = 0x00000800
+_IN_UNMOUNT = 0x00002000
+_IN_Q_OVERFLOW = 0x00004000
+_IN_IGNORED = 0x00008000
+_IN_ONLYDIR = 0x01000000
+_IN_EVENT = struct.Struct("iIII")
+_IN_WATCH_LOST = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_UNMOUNT | _IN_IGNORED
+
+
+class _TemporaryDirectoryEvents:
+  """Collect changed setup directories through one nonblocking inotify fd.
+
+  Watches are installed once during startup inventory. Lost coverage closes the
+  event stream; cleanup stops because directory scans cannot establish whether
+  setup file contents changed during the gap. Events arriving during ordinary
+  cleanup remain queued for the next drain.
+  """
+
+  def __init__(self, fd: int, add_watch):
+    self.fd: int | None = fd
+    self._add_watch = add_watch
+    self.paths: dict[int, Path] = {}
+
+  @classmethod
+  def open(cls) -> _TemporaryDirectoryEvents:
+    """Open Linux event tracking; initialization errors abort daemon startup."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.inotify_init1.argtypes = [ctypes.c_int]
+    libc.inotify_init1.restype = ctypes.c_int
+    libc.inotify_add_watch.argtypes = [
+      ctypes.c_int,
+      ctypes.c_char_p,
+      ctypes.c_uint32,
+    ]
+    libc.inotify_add_watch.restype = ctypes.c_int
+    fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if fd < 0:
+      error = ctypes.get_errno()
+      raise OSError(error, os.strerror(error))
+    return cls(fd, libc.inotify_add_watch)
+
+  def watch(self, path: Path, directory_fd: int) -> None:
+    """Register a startup watch on the already-opened directory."""
+    # The proc fd link refers to the directory already opened without following
+    # symlinks. Watching it avoids resolving a mutable path again.
+    descriptor = self._add_watch(
+      self.fd,
+      os.fsencode(f"/proc/self/fd/{directory_fd}"),
+      _IN_CREATE | _IN_MOVED_TO | _IN_WATCH_LOST | _IN_ONLYDIR,
+    )
+    if descriptor < 0:
+      error = ctypes.get_errno()
+      raise OSError(error, os.strerror(error), str(path))
+    self.paths[descriptor] = path
+
+  def changed_paths(self) -> set[Path] | None:
+    """Return dirty paths, or None when event coverage is unreliable."""
+    if self.fd is None:
+      return None
+    dirty = set()
+    try:
+      # FIONREAD supplies the actual queued byte count. One queue snapshot keeps
+      # concurrent writers from extending this read loop indefinitely.
+      queued = array.array("i", [0])
+      fcntl.ioctl(self.fd, termios.FIONREAD, queued, True)
+      if not queued[0]:
+        return dirty
+      data = os.read(self.fd, queued[0])
+      offset = 0
+      while offset < len(data):
+        descriptor, mask, _cookie, length = _IN_EVENT.unpack_from(data, offset)
+        offset += _IN_EVENT.size + length
+        if offset > len(data):
+          raise ValueError("Incomplete inotify event")
+        if mask & _IN_Q_OVERFLOW:
+          logger.warning("Temporary event queue overflowed; stopping cleanup.")
+          self.close()
+          return None
+        elif mask & _IN_WATCH_LOST:
+          logger.warning(
+            "Temporary directory changed or its watch was lost: %s; stopping cleanup.",
+            self.paths.get(descriptor),
+          )
+          self.close()
+          return None
+        elif descriptor in self.paths:
+          dirty.add(self.paths[descriptor])
+      return dirty
+    except (OSError, ValueError, struct.error) as exc:
+      logger.warning("Temporary event tracking failed; stopping cleanup: %s", exc)
+      self.close()
+      return None
+
+  def close(self) -> None:
+    if self.fd is not None:
+      os.close(self.fd)
+      self.fd = None
+    self.paths.clear()
 
 
 _TEMPORARY_DIRS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
 # Populated once at startup. Importing this module leaves cleanup disabled.
 _temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
+_temporary_events: _TemporaryDirectoryEvents | None = None
+
+
+@contextmanager
+def _open_temporary_directory(
+  path: Path,
+  baseline: dict[Path, _TemporaryDirectoryBaseline],
+  parent: Path | None = None,
+):
+  """Open through indexed ancestors, checking their identities and symlinks.
+
+  A matching leaf inode can be reached through a replaced parent symlink.
+  Opening each component relative to the previous fd checks the entire chain.
+  """
+  chain = [path]
+  ancestor = baseline[path].parent if path in baseline else parent
+  while ancestor is not None:
+    chain.append(ancestor)
+    ancestor = baseline[ancestor].parent
+  directory_fd = None
+  try:
+    for component in reversed(chain):
+      next_fd = os.open(
+        component if directory_fd is None else component.name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=directory_fd,
+      )
+      if directory_fd is not None:
+        os.close(directory_fd)
+      directory_fd = next_fd
+      if component in baseline:
+        info = os.fstat(directory_fd)
+        if (info.st_dev, info.st_ino) != baseline[component].identity:
+          raise OSError(errno.ESTALE, "Setup directory was replaced", str(component))
+    yield directory_fd
+  finally:
+    if directory_fd is not None:
+      os.close(directory_fd)
 
 
 def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
-  """Record immediate names in temporary roots before serving requests.
+  """Index setup directories under temporary roots once, before serving requests.
 
-  Setup directories are preserved as whole trees. Reserve configured Git paths
-  beneath these roots: the baseline survives requests, and request tracking
-  directories are removed by their owning contexts.
+  Each watch is installed before reading the directory's names. Repository and
+  backup trees and all Git tracking paths are excluded even when configured
+  under a temporary root. Tracking contexts remove their request directories.
+  Symlinked directories are retained as entries and are never traversed.
+  Absent temporary roots are allowed. Other initialization and inventory errors
+  propagate, closing the watcher before the daemon can serve requests.
   """
-  baseline = {}
-  for directory in _TEMPORARY_DIRS:
-    root = directory.resolve()
-    try:
-      info = root.stat()
-      with os.scandir(root) as entries:
-        names = {entry.name for entry in entries}
-      for tracking in (
+  global _temporary_events
+  if _temporary_events is not None:
+    _temporary_events.close()
+  _temporary_events = None
+  events = _TemporaryDirectoryEvents.open()
+  try:
+    baseline = {}
+    excluded = {
+      Path(path).resolve()
+      for path in (
+        REPO_DIR,
+        BACKUP_DIR,
         TRACKING_GIT_DIR,
         REQUEST_TRACKING_GIT_DIR,
         SCRATCH_TRACKING_GIT_DIR,
-      ):
-        tracking_path = Path(tracking).resolve()
-        if tracking_path.is_relative_to(root):
-          relative = tracking_path.relative_to(root)
-          if relative.parts:
-            names.add(relative.parts[0])
-      baseline[root] = _TemporaryDirectoryBaseline(
-        (info.st_dev, info.st_ino), frozenset(names)
       )
-    except FileNotFoundError:
-      # Some images have no /dev/shm; capture only roots present at startup.
-      continue
-    except OSError as exc:
-      logger.warning("Could not inventory temporary directory %s: %s", root, exc)
+    }
+    pending = []
+    for directory in _TEMPORARY_DIRS:
+      try:
+        path = directory.resolve(strict=True)
+      except FileNotFoundError:
+        # Images may omit temporary roots such as /dev/shm.
+        continue
+      pending.append((path, None))
+    seen = set()
+    while pending:
+      path, parent = pending.pop()
+      if any(path.is_relative_to(protected) for protected in excluded):
+        continue
+      with _open_temporary_directory(path, baseline, parent) as directory_fd:
+        info = os.fstat(directory_fd)
+        identity = (info.st_dev, info.st_ino)
+        # Directory aliases and bind mounts can revisit an already indexed inode.
+        if identity in seen:
+          continue
+        events.watch(path, directory_fd)
+        names = set()
+        children = []
+        with os.scandir(directory_fd) as entries:
+          for entry in entries:
+            names.add(entry.name)
+            if entry.is_dir(follow_symlinks=False):
+              children.append(path / entry.name)
+        for protected in excluded:
+          if protected.is_relative_to(path):
+            names.add(protected.relative_to(path).parts[0])
+        baseline[path] = _TemporaryDirectoryBaseline(identity, frozenset(names), parent)
+        seen.add(identity)
+        pending.extend((child, path) for child in children)
+  except BaseException:
+    # Release startup resources while preserving the original failure.
+    events.close()
+    raise
+  _temporary_events = events
   return baseline
 
 
 def _cleanup_temporary_entries() -> None:
   """Delete names absent from the startup baseline, logging cleanup failures.
 
-  Only new directory trees are traversed. Changes inside setup directories and
-  overwrites of setup files remain in place. Directory-relative operations keep
-  deletion anchored to the opened root; symlinks are unlinked.
+  Events select changed setup directories. Unreliable coverage stops cleanup.
+  New trees are removed recursively and symlinks are unlinked; existing file
+  contents are left as written. Failed removals are logged without retrying.
   """
-  for root, baseline in _temporary_baseline.items():
+  if _temporary_events is None:
+    return
+  changed = _temporary_events.changed_paths()
+  if changed is None:
+    return
+  for root in changed:
+    if root not in _temporary_baseline:
+      continue
+    baseline = _temporary_baseline[root]
     try:
-      directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-      try:
-        info = os.fstat(directory_fd)
-        if (info.st_dev, info.st_ino) != baseline.identity:
-          logger.warning("Skipping cleanup of replaced temporary root %s.", root)
-          continue
+      with _open_temporary_directory(root, _temporary_baseline) as directory_fd:
         with os.scandir(directory_fd) as entries:
           for entry in entries:
             if entry.name in baseline.entries:
@@ -134,8 +319,6 @@ def _cleanup_temporary_entries() -> None:
               logger.warning(
                 "Could not remove temporary entry %s: %s", root / entry.name, exc
               )
-      finally:
-        os.close(directory_fd)
     except OSError as exc:
       logger.warning("Could not clean temporary directory %s: %s", root, exc)
 
