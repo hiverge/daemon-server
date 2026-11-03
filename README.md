@@ -125,6 +125,14 @@ The binary is self-contained and has no external dependencies. It works with any
 
 No Python installation or pip packages required in the base image.
 
+When cleanup detects contamination, responses carry `X-Hive-Sandbox-Retired: true`;
+the current response keeps its body and status, and later execution receives 503.
+The daemon logs the contamination reason and exits with code 1. Deployment
+integration must remove retiring workers from the coordinator pool and replace
+the whole pod after any unexpected daemon exit, since container restarts
+preserve `/shared`. A completed request must not be replayed because of the
+retirement signal.
+
 ## Troubleshooting
 
 ### Binary won't execute
