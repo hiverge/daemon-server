@@ -815,19 +815,25 @@ class TestTemporaryEntryCleanup:
 
   @pytest.fixture(autouse=True)
   def _sandbox(self, monkeypatch, tmp_path):
-    self.roots = tuple(tmp_path / name for name in ("tmp", "var_tmp", "shm"))
+    self.root = tmp_path / "filesystem_root"
+    self.root.mkdir()
+    self.roots = tuple(self.root / name for name in ("tmp", "var/tmp", "dev/shm"))
     for root in self.roots:
-      root.mkdir()
-    self.repo = tmp_path / "repo"
-    self.backup = tmp_path / "backup"
+      root.mkdir(parents=True)
+    self.repo = self.root / "app"
+    self.backup = self.root / "shared" / "repo"
+    self.scratch = self.root / "scratch"
     self.repo.mkdir()
-    self.backup.mkdir()
+    self.backup.mkdir(parents=True)
+    self.scratch.mkdir()
     self.tracking = self.roots[0] / ".agent_git"
+    monkeypatch.setattr(main, "_ROOT_DIR", self.root)
     monkeypatch.setattr(main, "_TEMPORARY_DIRS", self.roots)
     monkeypatch.setattr(main, "_temporary_baseline", {})
     monkeypatch.setattr(main, "_temporary_events", None)
     monkeypatch.setattr(main, "REPO_DIR", f"{self.repo}/")
     monkeypatch.setattr(main, "BACKUP_DIR", f"{self.backup}/")
+    monkeypatch.setattr(main, "SCRATCH_DIR", str(self.scratch))
     monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(self.tracking))
     monkeypatch.setattr(main, "REQUEST_TRACKING_GIT_DIR", f"{self.tracking}.request")
     monkeypatch.setattr(main, "SCRATCH_TRACKING_GIT_DIR", f"{self.tracking}.scratch")
@@ -839,6 +845,124 @@ class TestTemporaryEntryCleanup:
 
   def _capture(self):
     main._temporary_baseline = main._capture_temporary_baseline()
+
+  def test_removes_new_entries_and_preserves_workspace_and_virtual_trees(
+    self, monkeypatch
+  ):
+    image_trees = tuple(self.root / name for name in ("app", "opt", "proc", "sys"))
+    for tree in image_trees:
+      (tree / "nested").mkdir(parents=True)
+      (tree / "nested" / "setup.txt").write_text("setup")
+    kept = self.root / "setup.txt"
+    kept.write_text("setup")
+    protected = (self.repo, self.backup, self.scratch, *image_trees[2:])
+    identities = {(path.stat().st_dev, path.stat().st_ino) for path in protected}
+    real_scandir = os.scandir
+
+    def avoid_protected_trees(path):
+      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+      assert (info.st_dev, info.st_ino) not in identities
+      return real_scandir(path)
+
+    monkeypatch.setattr(main.os, "scandir", avoid_protected_trees)
+    self._capture()
+    root_names = {entry.name for entry in self.root.iterdir()}
+    kept.write_text("modified")
+    for tree in image_trees:
+      (tree / "nested" / "new.txt").write_text("preserved")
+    (self.root / "new.log").write_text("remove")
+    new_tree = self.root / "new-folder"
+    (new_tree / "nested").mkdir(parents=True)
+    (new_tree / "nested" / "output").write_text("remove")
+    (self.root / "new_link").symlink_to(image_trees[1], target_is_directory=True)
+    (self.root / "broken_link").symlink_to(self.root / "missing")
+    nested_temporary = self.roots[0] / "cache"
+    nested_temporary.mkdir()
+
+    main._cleanup_temporary_entries()
+
+    assert {entry.name for entry in self.root.iterdir()} == root_names
+    assert kept.read_text() == "modified"
+    for tree in image_trees:
+      assert (tree / "nested" / "setup.txt").read_text() == "setup"
+      if tree == self.root / "opt":
+        assert not (tree / "nested" / "new.txt").exists()
+      else:
+        assert (tree / "nested" / "new.txt").read_text() == "preserved"
+    assert not nested_temporary.exists()
+
+  @pytest.mark.parametrize(
+    "configured_path", ["REPO_DIR", "BACKUP_DIR", "SCRATCH_DIR", "TRACKING_GIT_DIR"]
+  )
+  def test_preserves_configured_root_entries_created_after_capture(
+    self, monkeypatch, configured_path
+  ):
+    protected = self.root / "protected"
+    monkeypatch.setattr(main, configured_path, str(protected))
+    self._capture()
+    protected.mkdir()
+    (protected / "state").write_text("preserved")
+    (self.root / "probe.log").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    assert (protected / "state").read_text() == "preserved"
+    assert not (self.root / "probe.log").exists()
+
+  @pytest.mark.parametrize(
+    "directory",
+    [
+      "opt/runtime/lib",
+      "usr/local/lib/package",
+      "etc/service",
+      "home/user/.cache",
+      "shared/runtime",
+    ],
+  )
+  def test_cleans_deep_image_additions_and_retains_existing_contents(self, directory):
+    parent = self.root / directory
+    parent.mkdir(parents=True)
+    baseline_file = parent / "setup.txt"
+    baseline_file.write_text("setup")
+    self._capture()
+    baseline_file.write_text("modified")
+    (parent / "new.txt").write_text("remove")
+    new_tree = parent / "new-package" / "nested"
+    new_tree.mkdir(parents=True)
+    (new_tree / "output").write_text("remove")
+    (parent / "workspace-link").symlink_to(self.repo, target_is_directory=True)
+    (self.repo / "keep.txt").write_text("workspace")
+
+    main._cleanup_temporary_entries()
+
+    assert {entry.name for entry in parent.iterdir()} == {"setup.txt"}
+    assert baseline_file.read_text() == "modified"
+    assert (self.repo / "keep.txt").read_text() == "workspace"
+    assert not common_tools.is_contaminated()
+
+  def test_skips_device_tree_but_cleans_shared_memory(self, monkeypatch):
+    devices = self.root / "dev"
+    setup = self.roots[2] / "setup"
+    setup.mkdir()
+    (setup / "keep.txt").write_text("setup")
+    device_identity = (devices.stat().st_dev, devices.stat().st_ino)
+    real_scandir = os.scandir
+
+    def avoid_devices(path):
+      info = os.fstat(path) if isinstance(path, int) else os.stat(path)
+      assert (info.st_dev, info.st_ino) != device_identity
+      return real_scandir(path)
+
+    monkeypatch.setattr(main.os, "scandir", avoid_devices)
+    self._capture()
+    (devices / "runtime-device").write_text("preserved")
+    (setup / "new.txt").write_text("remove")
+
+    main._cleanup_temporary_entries()
+
+    assert (devices / "runtime-device").read_text() == "preserved"
+    assert (setup / "keep.txt").read_text() == "setup"
+    assert not (setup / "new.txt").exists()
 
   @pytest.mark.parametrize("root_index", [0, 1, 2])
   def test_removes_additions_and_preserves_setup_files(self, root_index):
@@ -925,7 +1049,7 @@ class TestTemporaryEntryCleanup:
 
     assert blocked.exists()
     assert not removable.exists()
-    assert "Could not remove temporary entry" in caplog.text
+    assert "Could not remove new filesystem entry" in caplog.text
     monkeypatch.setattr(main.os, "unlink", real_unlink)
     main._cleanup_temporary_entries()
     assert blocked.exists()
@@ -948,6 +1072,7 @@ class TestTemporaryEntryCleanup:
     self._capture()
     artifact = self.roots[0] / "probe.log"
     nested_artifact = nested / "probe.log"
+    root_artifact = self.root / "probe.log"
     move_directory = (
       f"Path({str(nested)!r}).rename({str(self.repo / 'moved')!r})\n"
       if lose_coverage
@@ -957,6 +1082,7 @@ class TestTemporaryEntryCleanup:
       "from pathlib import Path\n"
       f"Path({str(artifact)!r}).write_text('created')\n"
       f"Path({str(nested_artifact)!r}).write_text('created')\n"
+      f"Path({str(root_artifact)!r}).write_text('created')\n"
       f"{move_directory}"
       "print('completed')\n"
       f"raise SystemExit({exit_code})\n"
@@ -983,10 +1109,12 @@ class TestTemporaryEntryCleanup:
     if lose_coverage:
       assert main._temporary_events.fd is None
       assert artifact.exists()
+      assert root_artifact.exists()
       assert (self.repo / "moved" / "probe.log").exists()
       return
     assert not artifact.exists()
     assert not nested_artifact.exists()
+    assert not root_artifact.exists()
     if route == "/shell":
       tracking_inode = self.tracking.stat().st_ino
       response = client.post(route, json=payload)
@@ -994,10 +1122,12 @@ class TestTemporaryEntryCleanup:
       assert self.tracking.stat().st_ino == tracking_inode
       assert not artifact.exists()
       assert not nested_artifact.exists()
+      assert not root_artifact.exists()
 
   def test_cleans_on_handler_exception_before_unlocking(self, monkeypatch):
     self._capture()
     artifact = self.roots[0] / "probe.log"
+    root_artifact = self.root / "probe.log"
     real_cleanup = main._cleanup_temporary_entries
 
     def cleanup_while_locked():
@@ -1009,12 +1139,14 @@ class TestTemporaryEntryCleanup:
     @main.lock_sandbox()
     def failing_handler():
       artifact.write_text("created")
+      root_artifact.write_text("created")
       raise RuntimeError("handler failed")
 
     with pytest.raises(RuntimeError, match="handler failed"):
       failing_handler()
 
     assert not artifact.exists()
+    assert not root_artifact.exists()
     assert not main.sandbox_lock.locked()
 
   @pytest.mark.parametrize("route", ["/shell", "/run_code"])
@@ -1218,11 +1350,16 @@ class TestTemporaryEntryCleanup:
       os.fstat(original_fd)
     assert closed_fd.value.errno == errno.EBADF
 
-  def test_scans_only_event_dirty_directories(self, monkeypatch):
-    changed = self.roots[0] / "cache" / "nested"
-    quiet = self.roots[0] / "untouched_source"
-    changed.mkdir(parents=True)
-    quiet.mkdir()
+  @pytest.mark.parametrize("location", ["root", "temporary", "image"])
+  def test_scans_only_event_dirty_directories(self, monkeypatch, location):
+    changed = {
+      "root": self.root,
+      "temporary": self.roots[0] / "cache" / "nested",
+      "image": self.root / "opt" / "runtime" / "lib",
+    }[location]
+    quiet = self.root / "usr" / "local" / "untouched_source"
+    changed.mkdir(parents=True, exist_ok=True)
+    quiet.mkdir(parents=True)
     (quiet / "source.py").write_text("preserved")
     self._capture()
     assert main._temporary_events.fd is not None

@@ -149,12 +149,12 @@ class _TemporaryDirectoryEvents:
         if offset > len(data):
           raise ValueError("Incomplete inotify event")
         if mask & _IN_Q_OVERFLOW:
-          logger.warning("Temporary event queue overflowed; stopping cleanup.")
+          logger.warning("Filesystem event queue overflowed; stopping cleanup.")
           self.close()
           return None
         elif mask & _IN_WATCH_LOST:
           logger.warning(
-            "Temporary directory changed or its watch was lost: %s; stopping cleanup.",
+            "Setup directory changed or its watch was lost: %s; stopping cleanup.",
             self.paths.get(descriptor),
           )
           self.close()
@@ -163,7 +163,7 @@ class _TemporaryDirectoryEvents:
           dirty.add(self.paths[descriptor])
       return dirty
     except (OSError, ValueError, struct.error) as exc:
-      logger.warning("Temporary event tracking failed; stopping cleanup: %s", exc)
+      logger.warning("Filesystem event tracking failed; stopping cleanup: %s", exc)
       self.close()
       return None
 
@@ -174,6 +174,9 @@ class _TemporaryDirectoryEvents:
     self.paths.clear()
 
 
+# Ordinary filesystem trees are indexed from /; temporary roots also cover
+# /dev/shm beneath the excluded device tree.
+_ROOT_DIR = Path("/")
 _TEMPORARY_DIRS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
 # Populated once at startup. Importing this module leaves cleanup disabled.
 _temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
@@ -218,12 +221,15 @@ def _open_temporary_directory(
 
 
 def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
-  """Index setup directories under temporary roots once, before serving requests.
+  """Inventory cleanup directories once, before serving requests.
 
   Each watch is installed before reading the directory's names. Repository and
-  backup trees and all Git tracking paths are excluded even when configured
-  under a temporary root. Tracking contexts remove their request directories.
+  scratch workspaces, backup trees and Git tracking paths have their own request
+  lifecycle and are excluded. Kernel and device trees are skipped; /dev/shm is
+  indexed separately with the temporary roots.
   Symlinked directories are retained as entries and are never traversed.
+  Only directory names and identities are recorded; file contents are not read.
+  New trees are removed through their first new entry in an indexed parent.
   Absent temporary roots are allowed. Other initialization and inventory errors
   propagate, closing the watcher before the daemon can serve requests.
   """
@@ -239,23 +245,32 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
       for path in (
         REPO_DIR,
         BACKUP_DIR,
+        SCRATCH_DIR,
         TRACKING_GIT_DIR,
         REQUEST_TRACKING_GIT_DIR,
         SCRATCH_TRACKING_GIT_DIR,
       )
     }
-    pending = []
+    root_directory = _ROOT_DIR.resolve(strict=True)
+    virtual = tuple(root_directory / name for name in ("proc", "sys", "dev"))
+    temporary = []
     for directory in _TEMPORARY_DIRS:
       try:
         path = directory.resolve(strict=True)
       except FileNotFoundError:
         # Images may omit temporary roots such as /dev/shm.
         continue
-      pending.append((path, None))
+      temporary.append(path)
+    pending = [(path, None) for path in temporary]
+    pending.append((root_directory, None))
     seen = set()
     while pending:
       path, parent = pending.pop()
       if any(path.is_relative_to(protected) for protected in excluded):
+        continue
+      if any(path.is_relative_to(tree) for tree in virtual) and not any(
+        path.is_relative_to(directory) for directory in temporary
+      ):
         continue
       with _open_temporary_directory(path, baseline, parent) as directory_fd:
         info = os.fstat(directory_fd)
@@ -271,8 +286,10 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
             names.add(entry.name)
             if entry.is_dir(follow_symlinks=False):
               children.append(path / entry.name)
-        for protected in excluded:
-          if protected.is_relative_to(path):
+        # Reserve lifecycle and virtual-tree names even if they are created
+        # after inventory. Their owning subsystem controls their contents.
+        for protected in (*excluded, *virtual):
+          if protected != path and protected.is_relative_to(path):
             names.add(protected.relative_to(path).parts[0])
         baseline[path] = _TemporaryDirectoryBaseline(identity, frozenset(names), parent)
         seen.add(identity)
@@ -317,10 +334,10 @@ def _cleanup_temporary_entries() -> None:
               continue
             except OSError as exc:
               logger.warning(
-                "Could not remove temporary entry %s: %s", root / entry.name, exc
+                "Could not remove new filesystem entry %s: %s", root / entry.name, exc
               )
     except OSError as exc:
-      logger.warning("Could not clean temporary directory %s: %s", root, exc)
+      logger.warning("Could not clean setup directory %s: %s", root, exc)
 
 
 def lock_sandbox():
@@ -338,7 +355,7 @@ def lock_sandbox():
           return f(*args, **kwargs)
       finally:
         # Handlers have collected their response and finished process cleanup.
-        # Keep the lock until temporary entries are removed so the next request
+        # Keep the lock until new entries are removed so the next request
         # cannot start while this request's filesystem cleanup is running.
         try:
           _cleanup_temporary_entries()
