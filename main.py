@@ -218,8 +218,7 @@ _temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
 _temporary_events: _TemporaryDirectoryEvents | None = None
 _temporary_excluded: frozenset[Path] = frozenset()
 _temporary_virtual: frozenset[Path] = frozenset()
-# Detection is kept separate from process-survivor restarts. Sandbox retirement
-# will consume this sticky reason in a later layer; it has no HTTP effect yet.
+# The execution gate and retirement hook consume this sticky reason.
 _filesystem_contamination_reason: str | None = None
 
 
@@ -404,7 +403,20 @@ def _cleanup_temporary_entries() -> None:
       logger.warning("Could not clean setup directory %s: %s", root, exc)
 
 
+def _is_sandbox_contaminated() -> bool:
+  """Share the retirement decision between admission and response handling."""
+  return _filesystem_contamination_reason is not None or common_tools.is_contaminated()
+
+
 def lock_sandbox():
+  """Serialize execution and refuse reuse after contamination.
+
+  Check contamination after acquiring the lock, so the preceding request has
+  finished cleanup before the decision. A request that contaminates the worker
+  keeps its original response; subsequent requests are refused before their
+  handler or cleanup runs. The lock is released on every exit path.
+  """
+
   def decorator(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -415,48 +427,83 @@ def lock_sandbox():
         ), 429
 
       try:
-        with common_tools.request_process_cleanup():
-          return f(*args, **kwargs)
-      finally:
-        # Handlers have collected their response and finished process cleanup.
-        # Keep the lock until new entries are removed so the next request
-        # cannot start while this request's filesystem cleanup is running.
+        if _is_sandbox_contaminated():
+          logger.info("Sandbox is contaminated. Rejecting new execution request.")
+          return jsonify(
+            {
+              "status": "failed",
+              "error": "Sandbox is contaminated and cannot accept further execution.",
+            }
+          ), 503
         try:
-          _cleanup_temporary_entries()
+          with common_tools.request_process_cleanup():
+            return f(*args, **kwargs)
         finally:
-          sandbox_lock.release()
+          # Cleanup completes before the lock becomes available to the next
+          # request, including when the handler raises.
+          _cleanup_temporary_entries()
+      finally:
+        sandbox_lock.release()
 
     return decorated_function
 
   return decorator
 
 
-# How long to let the WSGI server flush the response before exiting.
-_RESTART_GRACE = 1.0
+# The header lets the coordinator retain the result and stop using this worker.
+SANDBOX_RETIRED_HEADER = "X-Hive-Sandbox-Retired"
+# Retain the existing response-flush grace. This allows time for WSGI to send
+# the response; it cannot guarantee the caller has received it.
+_RETIREMENT_GRACE = 1.0
+_retirement_timer: threading.Timer | None = None
 
 
-def _restart_container() -> None:
-  """Exit so the container restarts, discarding anything left running in it.
+def _retire_sandbox() -> None:
+  """Log why the sandbox is unsafe and exit with the existing failure status.
 
-  The daemon is PID 1 in the sandbox container, so ending it ends the container's
-  PID namespace, taking any survivor with it, and the kubelet starts a
-  replacement.
+  The daemon runs as PID 1, so exiting also ends surviving container processes.
+  The operator must replace the whole pod: restarting its container preserves
+  per-pod volumes, including /shared.
   """
   logger.warning(
-    "A process survived this evaluation and is still running on the pod. "
-    "Restarting the container so it cannot affect later measurements."
+    "Exiting contaminated sandbox for replacement.",
+    extra={
+      "filesystem_contamination_reason": _filesystem_contamination_reason,
+      "process_cleanup_failed": common_tools.is_contaminated(),
+    },
   )
   # `os._exit` skips interpreter cleanup, which would join the abandoned readers.
   os._exit(1)
 
 
 @app.after_request
-def _restart_if_contaminated(response):
-  """Restart the container once a survivor makes its measurements unreliable."""
-  if common_tools.is_contaminated():
-    # After the response: this evaluation ran on a clean pod, only later ones are
-    # at risk.
-    threading.Timer(_RESTART_GRACE, _restart_container).start()
+def _retire_if_contaminated(response):
+  """Flag retirement while preserving the completed response's body and status.
+
+  Cleanup runs before this hook. The coordinator can keep the result and remove
+  the worker from its pool as soon as it sees the header. Subsequent execution
+  is refused by the admission gate while the response-flush grace runs.
+  """
+  global _retirement_timer
+  if _is_sandbox_contaminated():
+    response.headers[SANDBOX_RETIRED_HEADER] = "true"
+    # A health check or busy response can observe contamination during another
+    # request's cleanup. Let that request's response schedule exit after cleanup.
+    if sandbox_lock.acquire(blocking=False):
+      try:
+        # Repeated responses share one timer, guarded by the request lock.
+        if _retirement_timer is None:
+          try:
+            timer = threading.Timer(_RETIREMENT_GRACE, _retire_sandbox)
+            timer.start()
+          except RuntimeError as exc:
+            # Thread exhaustion can prevent startup. Preserve this response and
+            # leave scheduling available for the next response to retry.
+            logger.warning("Could not schedule sandbox retirement: %s", exc)
+          else:
+            _retirement_timer = timer
+      finally:
+        sandbox_lock.release()
   return response
 
 

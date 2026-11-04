@@ -35,8 +35,6 @@ def linux_subreaper(monkeypatch):
   assert libc.prctl(37, common_tools.ctypes.addressof(original), 0, 0, 0) == 0
   monkeypatch.setattr(common_tools, "_subreaper_enabled", False)
   assert common_tools.enable_process_cleanup()
-  # Assertions report cleanup failures without a restart timer exiting pytest.
-  monkeypatch.setattr(main, "_restart_container", lambda: None)
   try:
     yield
   finally:
@@ -45,6 +43,12 @@ def linux_subreaper(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _scratch_directory(monkeypatch, tmp_path):
+  # Each test starts with a fresh daemon's contamination state.
+  monkeypatch.setattr(main, "_filesystem_contamination_reason", None)
+  monkeypatch.setattr(common_tools, "_contaminated", main.threading.Event())
+  monkeypatch.setattr(main, "_retirement_timer", None)
+  # Record timers without exiting the test runner after a contamination assertion.
+  monkeypatch.setattr(main.threading, "Timer", lambda delay, fn: _MockTimer(delay, []))
   (tmp_path / "scratch").mkdir()
   monkeypatch.setattr(main, "SCRATCH_DIR", str(tmp_path / "scratch"))
   monkeypatch.setattr(main, "TRACKING_GIT_DIR", str(tmp_path / ".agent_git"))
@@ -73,12 +77,6 @@ def _scratch_directory(monkeypatch, tmp_path):
   monkeypatch.setattr(main, "execute_shell_command", execute_after_setup)
 
 
-class _Response:
-  """
-  Stand-in for the Flask response that `after_request` hooks receive and return.
-  """
-
-
 class _MockTimer:
   """
   Stand-in for `threading.Timer` that records the delay instead of arming a timer.
@@ -90,6 +88,255 @@ class _MockTimer:
 
   def start(self) -> None:
     self._recorder.append(self._delay)
+
+
+class TestSandboxExecutionGate:
+  """Refuse unsafe workers before touching execution state."""
+
+  @pytest.mark.parametrize("route", ["/shell", "/run_code"])
+  @pytest.mark.parametrize("source", ["filesystem", "process"])
+  def test_rejects_contaminated_worker_without_execution_or_cleanup(
+    self, route, source, monkeypatch
+  ):
+    if source == "filesystem":
+      main._record_filesystem_contamination("Setup state changed.")
+    else:
+      common_tools.mark_contaminated()
+
+    def no_execution(*args, **kwargs):
+      pytest.fail("A refused request touched execution or cleanup state.")
+
+    monkeypatch.setattr(main, "execute_python_function", no_execution)
+    monkeypatch.setattr(main, "execute_shell_command", no_execution)
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", no_execution)
+    monkeypatch.setattr(common_tools, "request_process_cleanup", no_execution)
+    client = main.app.test_client()
+
+    for _ in range(2):
+      # Missing payload fields also verify refusal happens before validation.
+      response = client.post(route, json={})
+      assert response.status_code == 503
+      assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+      assert response.get_json() == {
+        "status": "failed",
+        "error": "Sandbox is contaminated and cannot accept further execution.",
+      }
+      assert not main.sandbox_lock.locked()
+
+  def test_busy_worker_remains_owned_by_its_current_request(self, monkeypatch):
+    """A concurrent call cannot acquire or release the active request's lock."""
+    main._record_filesystem_contamination("The active request changed setup state.")
+
+    def no_cleanup(*args, **kwargs):
+      pytest.fail("A busy request ran cleanup.")
+
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", no_cleanup)
+    with main.sandbox_lock:
+      response = main.app.test_client().post("/shell", json={})
+      assert response.status_code == 429
+      assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+      assert main.sandbox_lock.locked()
+      assert main._retirement_timer is None
+    assert not main.sandbox_lock.locked()
+
+  @pytest.mark.parametrize("status", [200, 400])
+  def test_process_cleanup_contamination_preserves_the_completed_response(
+    self, status, monkeypatch
+  ):
+    calls = []
+
+    @contextlib.contextmanager
+    def failed_process_cleanup():
+      yield
+      calls.append("process cleanup")
+      common_tools.mark_contaminated()
+
+    def filesystem_cleanup():
+      assert main.sandbox_lock.locked()
+      calls.append("filesystem cleanup")
+
+    monkeypatch.setattr(common_tools, "request_process_cleanup", failed_process_cleanup)
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", filesystem_cleanup)
+
+    @main.lock_sandbox()
+    def handler():
+      calls.append("handler")
+      return main.jsonify({"output": "completed"}), status
+
+    with main.app.test_request_context():
+      response, returned_status = handler()
+      assert returned_status == status
+      assert response.get_json() == {"output": "completed"}
+      completed = main.app.process_response(
+        main.app.make_response((response, returned_status))
+      )
+      assert completed.status_code == status
+      assert completed.get_json() == {"output": "completed"}
+      assert completed.headers["X-Hive-Sandbox-Retired"] == "true"
+      refused, refused_status = handler()
+      assert refused_status == 503
+      assert refused.get_json()["status"] == "failed"
+
+    assert calls == ["handler", "process cleanup", "filesystem cleanup"]
+    assert not main.sandbox_lock.locked()
+
+
+class TestSandboxRetirement:
+  """Verify the retirement signals consumed by the coordinator and operator."""
+
+  @pytest.mark.parametrize("source", ["filesystem", "process"])
+  @pytest.mark.parametrize("status", [200, 400])
+  def test_signals_retirement_without_changing_the_response(
+    self, source, status, monkeypatch
+  ):
+    if source == "filesystem":
+      main._record_filesystem_contamination("Setup state changed.")
+    else:
+      common_tools.mark_contaminated()
+    delays = []
+    callbacks = []
+
+    def timer(delay, callback):
+      callbacks.append(callback)
+      return _MockTimer(delay, delays)
+
+    monkeypatch.setattr(main.threading, "Timer", timer)
+    response = main.app.response_class(
+      '{"output":"completed"}', status=status, content_type="application/json"
+    )
+    body = response.get_data()
+
+    assert main._retire_if_contaminated(response) is response
+    assert response.status_code == status
+    assert response.get_data() == body
+    assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+    client = main.app.test_client()
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.get_json() == {"status": "healthy"}
+    assert health.headers["X-Hive-Sandbox-Retired"] == "true"
+    assert client.post("/shell", json={}).status_code == 503
+    # Later responses keep the first timer, including after both flags are set.
+    main._record_filesystem_contamination("Setup state changed.")
+    common_tools.mark_contaminated()
+    assert client.post("/run_code", json={}).status_code == 503
+    assert delays == [main._RETIREMENT_GRACE]
+    assert callbacks == [main._retire_sandbox]
+
+  def test_clean_response_has_no_retirement_signal(self, monkeypatch):
+    def no_timer(*args, **kwargs):
+      pytest.fail("A clean worker scheduled retirement.")
+
+    monkeypatch.setattr(main.threading, "Timer", no_timer)
+    response = main.app.test_client().get("/health")
+    assert response.status_code == 200
+    assert response.get_json() == {"status": "healthy"}
+    assert "X-Hive-Sandbox-Retired" not in response.headers
+    assert main._retirement_timer is None
+
+  @pytest.mark.parametrize("source", ["filesystem", "process"])
+  @pytest.mark.parametrize("status", [200, 400])
+  def test_failed_timer_start_preserves_response_and_retries(
+    self, source, status, monkeypatch, caplog
+  ):
+    timers = []
+    delays = []
+
+    class FailOnceTimer(_MockTimer):
+      def start(self):
+        if len(timers) == 1:
+          raise RuntimeError("can't start new thread")
+        super().start()
+
+    def timer(delay, callback):
+      assert callback is main._retire_sandbox
+      result = FailOnceTimer(delay, delays)
+      timers.append(result)
+      return result
+
+    def execution(*args, **kwargs):
+      if status == 400:
+        raise common_tools.FunctionExecutionError("completed failure")
+      return "completed"
+
+    def cleanup():
+      if source == "filesystem":
+        main._record_filesystem_contamination("Setup state changed.")
+      else:
+        common_tools.mark_contaminated()
+
+    monkeypatch.setattr(main.threading, "Timer", timer)
+    monkeypatch.setattr(main, "execute_python_function", execution)
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", cleanup)
+    monkeypatch.setattr(
+      common_tools, "request_process_cleanup", lambda: contextlib.nullcontext()
+    )
+    client = main.app.test_client()
+    response = client.post("/run_code", json={"code": {}, "timeout": 30})
+    assert response.status_code == status
+    if status == 400:
+      assert response.get_json() == {"status": "failed", "error": "completed failure"}
+    else:
+      assert response.get_data(as_text=True) == "completed"
+    assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+    assert main._retirement_timer is None
+    assert delays == []
+    assert not main.sandbox_lock.locked()
+    assert "Could not schedule sandbox retirement" in caplog.text
+
+    def no_execution(*args, **kwargs):
+      pytest.fail("A refused request touched execution or cleanup state.")
+
+    monkeypatch.setattr(main, "execute_python_function", no_execution)
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", no_execution)
+    refused = client.post("/run_code", json={})
+    assert refused.status_code == 503
+    assert refused.headers["X-Hive-Sandbox-Retired"] == "true"
+    assert main._retirement_timer is timers[1]
+    assert delays == [main._RETIREMENT_GRACE]
+    client.get("/health")
+    assert len(timers) == 2
+    assert not main.sandbox_lock.locked()
+
+  @pytest.mark.parametrize("source", ["filesystem", "process"])
+  def test_health_check_defers_exit_until_active_cleanup_finishes(self, source):
+    if source == "filesystem":
+      main._record_filesystem_contamination("Cleanup found a setup mutation.")
+    else:
+      common_tools.mark_contaminated()
+    client = main.app.test_client()
+    with main.sandbox_lock:
+      response = client.get("/health")
+      assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+      assert main._retirement_timer is None
+      assert main.sandbox_lock.locked()
+
+    client.get("/health")
+    assert main._retirement_timer is not None
+    assert not main.sandbox_lock.locked()
+
+  @pytest.mark.parametrize("source", ["filesystem", "process"])
+  def test_retirement_logs_the_reason_and_exits_with_failure(self, source):
+    """Observe the real exit and structured reason in a separate interpreter."""
+    script = "import main, common_tools\n"
+    if source == "filesystem":
+      script += "main._record_filesystem_contamination('Setup state changed.')\n"
+    else:
+      script += "common_tools.mark_contaminated()\n"
+    script += "main._retire_sandbox()\n"
+    result = subprocess.run(
+      [sys.executable, "-c", script],
+      cwd=pathlib.Path(main.__file__).parent,
+      capture_output=True,
+      timeout=10,
+    )
+    assert result.returncode == 1
+    record = json.loads(result.stderr.splitlines()[-1])
+    assert record["message"] == "Exiting contaminated sandbox for replacement."
+    assert record["filesystem_contamination_reason"] == (
+      "Setup state changed." if source == "filesystem" else None
+    )
+    assert record["process_cleanup_failed"] == (source == "process")
 
 
 class TestEvaluationArguments:
@@ -527,26 +774,6 @@ class TestShellCommandDescendants:
       "secret source line" in record.getMessage() for record in caplog.records
     )
 
-  def test_schedules_a_restart_once_the_pod_is_contaminated(
-    self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-    """
-    A survivor triggers a container restart.
-    """
-    # given a contaminated pod, and a stand-in for the timer so the exit never
-    # runs here.
-    restarts: list[float] = []
-    monkeypatch.setattr(
-      main.threading, "Timer", lambda delay, fn: _MockTimer(delay, restarts)
-    )
-    common_tools.mark_contaminated()
-
-    # when a response goes out.
-    main._restart_if_contaminated(_Response())
-
-    # then a restart was scheduled at the grace delay.
-    assert restarts == [main._RESTART_GRACE]
-
 
 class TestShellChangeTracking:
   """Report each command's changes using a fresh copy of the startup index."""
@@ -978,8 +1205,10 @@ class TestTemporaryEntryCleanup:
 
   @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
   @pytest.mark.parametrize("route", ["/shell", "/run_code"])
-  def test_http_execution_records_mutation_and_preserves_response(
-    self, route, monkeypatch
+  @pytest.mark.parametrize("next_route", ["/shell", "/run_code"])
+  @pytest.mark.parametrize("exit_code", [0, 7])
+  def test_http_mutation_preserves_response_then_refuses_reuse(
+    self, route, next_route, exit_code, monkeypatch
   ):
     original = self.root / "opt" / "library.so"
     original.parent.mkdir()
@@ -989,6 +1218,7 @@ class TestTemporaryEntryCleanup:
       "from pathlib import Path\n"
       f"Path({str(original)!r}).write_text('request')\n"
       "print('completed')\n"
+      f"raise SystemExit({exit_code})\n"
     )
     payload = (
       {
@@ -1004,17 +1234,38 @@ class TestTemporaryEntryCleanup:
       }
     )
 
-    def no_restart(*args, **kwargs):
-      pytest.fail("Filesystem detection scheduled a container restart.")
+    delays = []
+    callbacks = []
 
-    monkeypatch.setattr(main.threading, "Timer", no_restart)
-    response = main.app.test_client().post(route, json=payload)
+    def timer(delay, callback):
+      callbacks.append(callback)
+      return _MockTimer(delay, delays)
 
-    assert response.status_code == 200
+    monkeypatch.setattr(main.threading, "Timer", timer)
+    client = main.app.test_client()
+    response = client.post(route, json=payload)
+
+    assert response.status_code == (400 if route == "/run_code" and exit_code else 200)
     assert "completed" in response.get_data(as_text=True)
+    assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+    assert delays == [main._RETIREMENT_GRACE]
+    assert callbacks == [main._retire_sandbox]
     assert str(original) in main._filesystem_contamination_reason
     assert original.read_text() == "request"
     assert not common_tools.is_contaminated()
+    assert not main.sandbox_lock.locked()
+
+    def no_execution(*args, **kwargs):
+      pytest.fail("A contaminated worker executed or cleaned another request.")
+
+    monkeypatch.setattr(main, "execute_python_function", no_execution)
+    monkeypatch.setattr(main, "execute_shell_command", no_execution)
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", no_execution)
+    monkeypatch.setattr(common_tools, "request_process_cleanup", no_execution)
+    refused = client.post(next_route, json={})
+    assert refused.status_code == 503
+    assert refused.headers["X-Hive-Sandbox-Retired"] == "true"
+    assert delays == [main._RETIREMENT_GRACE]
     assert not main.sandbox_lock.locked()
 
   def test_removes_new_entries_and_preserves_workspace_and_virtual_trees(
@@ -1236,10 +1487,12 @@ class TestTemporaryEntryCleanup:
       ("/run_code", 0, False),
       ("/run_code", 7, False),
       ("/shell", 0, True),
+      ("/run_code", 0, True),
+      ("/run_code", 7, True),
     ],
   )
   def test_preserves_response_after_cleanup_or_coverage_loss(
-    self, route, exit_code, lose_coverage
+    self, route, exit_code, lose_coverage, monkeypatch
   ):
     nested = self.roots[0] / "setup_cache" / "nested"
     nested.mkdir(parents=True)
@@ -1274,6 +1527,10 @@ class TestTemporaryEntryCleanup:
         "timeout": 30,
       }
 
+    delays = []
+    monkeypatch.setattr(
+      main.threading, "Timer", lambda delay, callback: _MockTimer(delay, delays)
+    )
     client = main.app.test_client()
     response = client.post(route, json=payload)
     expected_status = 400 if route == "/run_code" and exit_code else 200
@@ -1285,7 +1542,24 @@ class TestTemporaryEntryCleanup:
       assert artifact.exists()
       assert root_artifact.exists()
       assert (self.repo / "moved" / "probe.log").exists()
+      assert response.headers["X-Hive-Sandbox-Retired"] == "true"
+      assert delays == [main._RETIREMENT_GRACE]
+
+      def no_execution(*args, **kwargs):
+        pytest.fail("Lost event coverage allowed another execution or cleanup.")
+
+      monkeypatch.setattr(main, "execute_python_function", no_execution)
+      monkeypatch.setattr(main, "execute_shell_command", no_execution)
+      monkeypatch.setattr(main, "_cleanup_temporary_entries", no_execution)
+      monkeypatch.setattr(common_tools, "request_process_cleanup", no_execution)
+      refused = client.post(route, json={})
+      assert refused.status_code == 503
+      assert refused.headers["X-Hive-Sandbox-Retired"] == "true"
+      assert delays == [main._RETIREMENT_GRACE]
+      assert not main.sandbox_lock.locked()
       return
+    assert "X-Hive-Sandbox-Retired" not in response.headers
+    assert delays == []
     assert not artifact.exists()
     assert not nested_artifact.exists()
     assert not root_artifact.exists()
@@ -1298,6 +1572,7 @@ class TestTemporaryEntryCleanup:
       assert not nested_artifact.exists()
       assert not root_artifact.exists()
 
+  @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux inotify")
   def test_cleans_on_handler_exception_before_unlocking(self, monkeypatch):
     self._capture()
     artifact = self.roots[0] / "probe.log"
