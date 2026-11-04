@@ -1,17 +1,21 @@
 """Common functionality across sandboxex."""
 
 import contextlib
+import ctypes
 import io
 import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Generator, MutableSequence, Sequence
+from dataclasses import dataclass
 from typing import IO
 
+import psutil
 import requests
 
 logger = logging.getLogger(__name__)
@@ -79,6 +83,156 @@ PROCESS_GROUP_KILL_TIMEOUT = 5.0
 # competes for CPU, memory and I/O with whatever runs next, so a candidate timed
 # against it is scored on a machine that is not idle.
 _contaminated = threading.Event()
+_subreaper_enabled = False
+_request_processes = threading.local()
+
+
+def enable_process_cleanup() -> bool:
+  """Adopt orphaned request descendants on Linux before serving requests.
+
+  A child subreaper receives descendants whose intermediate parents exit,
+  including workers that detach into a new session. Cleanup stays within the
+  daemon's process tree and can therefore also run outside a private namespace.
+  If the runtime cannot enable adoption, process-group cleanup remains available.
+  """
+  global _subreaper_enabled
+  if _subreaper_enabled:
+    return True
+  if sys.platform != "linux":
+    return False
+  try:
+    # Resolve prctl from the C library already loaded in this process. Preserve
+    # its errno value so ctypes.get_errno() can explain a failed call below.
+    libc = ctypes.CDLL(None, use_errno=True)
+    # prctl takes an int operation followed by four unsigned-long arguments.
+    # Declare their widths explicitly so ctypes passes machine-word arguments.
+    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    # The C return value is an int: zero means success and -1 means failure here.
+    libc.prctl.restype = ctypes.c_int
+    # PR_SET_CHILD_SUBREAPER is 36 in Linux UAPI's <linux/prctl.h>.
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
+      error = ctypes.get_errno()
+      raise OSError(error, os.strerror(error))
+    _subreaper_enabled = True
+    return True
+  except (AttributeError, OSError) as exc:
+    logger.warning("Could not enable detached-process cleanup: %s", exc)
+    return False
+
+
+@dataclass(frozen=True)
+class _ChildProcess:
+  """A descendant's identity and parent captured during a process-tree scan."""
+
+  process: psutil.Process
+  started: float
+  parent: int
+
+
+def _descendant_processes() -> dict[int, _ChildProcess]:
+  """Snapshot the daemon's descendants, skipping processes that exit mid-scan."""
+  children = {}
+  for process in psutil.Process().children(recursive=True):
+    try:
+      children[process.pid] = _ChildProcess(
+        process, process.create_time(), process.ppid()
+      )
+    except psutil.NoSuchProcess:
+      continue
+  return children
+
+
+class _RequestProcessCleanup:
+  """Stop new descendants while preserving pre-request processes and helpers.
+
+  PID and creation time distinguish a surviving setup process from a reused PID.
+  New children of surviving setup helpers are preserved through their ancestry.
+  A rescan after termination finds grandchildren adopted by the subreaper.
+  """
+
+  def __init__(self):
+    self.baseline = {
+      (pid, child.started) for pid, child in _descendant_processes().items()
+    }
+
+  def _targets(self, exclude_pid: int | None) -> list[psutil.Process]:
+    children = _descendant_processes()
+    protected = {
+      pid for pid, child in children.items() if (pid, child.started) in self.baseline
+    }
+    # Propagate protection through this snapshot without repeatedly scanning /proc.
+    while True:
+      inherited = {pid for pid, child in children.items() if child.parent in protected}
+      if inherited <= protected:
+        break
+      protected.update(inherited)
+    return [
+      child.process
+      for pid, child in children.items()
+      if pid not in protected and pid != exclude_pid
+    ]
+
+  def cleanup(self, exclude_pid: int | None = None) -> None:
+    """Kill and reap request survivors within the existing termination budget.
+
+    The caller's Popen leader is excluded when group cleanup calls this method;
+    Popen retains ownership of its exit status. Final request cleanup has no
+    exclusion. psutil checks PID reuse again before sending each signal.
+    """
+    deadline = time.monotonic() + PROCESS_GROUP_KILL_TIMEOUT
+    try:
+      while targets := self._targets(exclude_pid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          logger.warning("Request processes remain after the termination deadline.")
+          mark_contaminated()
+          return
+        for process in targets:
+          try:
+            process.kill()
+          except psutil.NoSuchProcess:
+            continue
+          except (psutil.Error, OSError) as exc:
+            # Continue signalling the other workers even if one is inaccessible.
+            logger.warning("Could not kill request process %d: %s", process.pid, exc)
+            mark_contaminated()
+        _, alive = psutil.wait_procs(
+          targets, timeout=max(0.0, deadline - time.monotonic())
+        )
+        if alive:
+          logger.warning(
+            "Request processes survived cleanup: %s", [p.pid for p in alive]
+          )
+          mark_contaminated()
+          return
+    except (psutil.Error, OSError) as exc:
+      logger.warning("Could not finish request process cleanup: %s", exc)
+      mark_contaminated()
+
+
+@contextlib.contextmanager
+def request_process_cleanup() -> Generator[None, None, None]:
+  """Capture pre-request descendants and stop new ones on every exit path."""
+  if not _subreaper_enabled:
+    yield
+    return
+  scope = None
+  try:
+    scope = _RequestProcessCleanup()
+  except (psutil.Error, OSError) as exc:
+    # An incomplete baseline cannot safely distinguish setup helpers from workers.
+    logger.warning("Could not capture the request process baseline: %s", exc)
+    mark_contaminated()
+  previous = getattr(_request_processes, "cleanup", None)
+  _request_processes.cleanup = scope
+  try:
+    yield
+  finally:
+    try:
+      if scope is not None:
+        scope.cleanup()
+    finally:
+      _request_processes.cleanup = previous
 
 
 def mark_contaminated() -> None:
@@ -134,17 +288,15 @@ def last_output_lines(
 
 
 def kill_process_group(process: subprocess.Popen) -> None:
-  """Kill `process` and every descendant it started.
+  """Kill the command's group and detached workers in the current request scope.
 
   Requires `process` to have been started with `start_new_session=True`, which
   makes it the leader of its own process group. Safe to call after `process` has
   exited: the group outlives its leader while any member runs, so this also reaps
   orphans left by a clean exit.
 
-  Signals only. `release_process` does the bounded wait for the leader to die.
-
-  Best effort — a descendant that calls `setsid()` or double-forks leaves the
-  group and survives.
+  `release_process` owns the leader's wait. With subreaper support enabled, the
+  request scope also kills and reaps workers that leave the command's group.
   """
   # The group id is the leader's pid. `os.getpgid()` would fail once the leader
   # has been reaped, while the rest of the group is still running.
@@ -153,6 +305,9 @@ def kill_process_group(process: subprocess.Popen) -> None:
   except ProcessLookupError:
     # The group is already gone.
     pass
+  scope = getattr(_request_processes, "cleanup", None)
+  if scope is not None:
+    scope.cleanup(exclude_pid=process.pid)
 
 
 def start_stream_readers(

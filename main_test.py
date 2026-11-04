@@ -19,6 +19,29 @@ import main
 from conftest import wait_until_dead
 
 
+@pytest.fixture
+def linux_subreaper(monkeypatch):
+  """Enable orphan adoption for one test and restore the runner's kernel setting."""
+  if sys.platform != "linux":
+    pytest.skip("Requires Linux child subreapers")
+  # Match the production prctl declaration. Unsigned-long arguments also carry
+  # the address used by PR_GET_CHILD_SUBREAPER without truncating it.
+  libc = common_tools.ctypes.CDLL(None, use_errno=True)
+  libc.prctl.argtypes = [common_tools.ctypes.c_int] + [common_tools.ctypes.c_ulong] * 4
+  libc.prctl.restype = common_tools.ctypes.c_int
+  original = common_tools.ctypes.c_int()
+  # PR_GET_CHILD_SUBREAPER is 37 in Linux UAPI's <linux/prctl.h>.
+  assert libc.prctl(37, common_tools.ctypes.addressof(original), 0, 0, 0) == 0
+  monkeypatch.setattr(common_tools, "_subreaper_enabled", False)
+  assert common_tools.enable_process_cleanup()
+  # Assertions report cleanup failures without a restart timer exiting pytest.
+  monkeypatch.setattr(main, "_restart_container", lambda: None)
+  try:
+    yield
+  finally:
+    assert libc.prctl(36, original.value, 0, 0, 0) == 0
+
+
 @pytest.fixture(autouse=True)
 def _scratch_directory(monkeypatch, tmp_path):
   (tmp_path / "scratch").mkdir()
@@ -993,6 +1016,96 @@ class TestTemporaryEntryCleanup:
 
     assert not artifact.exists()
     assert not main.sandbox_lock.locked()
+
+  @pytest.mark.parametrize("route", ["/shell", "/run_code"])
+  @pytest.mark.parametrize("exit_code", [0, 7, None])
+  @pytest.mark.parametrize("double_fork", [False, True])
+  def test_stops_detached_writer_before_filesystem_cleanup(
+    self, route, exit_code, double_fork, linux_subreaper, monkeypatch
+  ):
+    setup = self.roots[0] / "setup_cache"
+    setup.mkdir()
+    self._capture()
+    artifact = setup / "probe.log"
+    pid_file = self.repo / "worker.pid"
+    worker_code = (
+      "import os, time\n"
+      "from pathlib import Path\n"
+      # The intermediate parents exit before the writer publishes its PID.
+      + (
+        "if os.fork(): os._exit(0)\nos.setsid()\nif os.fork(): os._exit(0)\n"
+        if double_fork
+        else ""
+      )
+      + f"artifact = Path({str(artifact)!r})\n"
+      "artifact.write_text('created')\n"
+      f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+      "while True:\n"
+      "    artifact.write_text('created')\n"
+      "    time.sleep(0.01)\n"
+    )
+    script = (
+      "import subprocess, sys, time\n"
+      "from pathlib import Path\n"
+      f"worker = subprocess.Popen([sys.executable, '-c', {worker_code!r}],\n"
+      "    start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+      f"while not Path({str(pid_file)!r}).exists():\n"
+      "    if worker.poll() is not None and worker.returncode != 0:\n"
+      "        raise RuntimeError('Worker failed to start')\n"
+      "    time.sleep(0.01)\n"
+      "print('completed', flush=True)\n"
+      + (
+        "time.sleep(60)\n" if exit_code is None else f"raise SystemExit({exit_code})\n"
+      )
+    )
+    helper = subprocess.Popen(
+      [sys.executable, "-c", "import time; time.sleep(60)"],
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.DEVNULL,
+    )
+    real_cleanup = main._cleanup_temporary_entries
+    checked = []
+
+    def cleanup_after_writer_stops():
+      assert main.sandbox_lock.locked()
+      pid = int(pid_file.read_text())
+      with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+      checked.append(pid)
+      real_cleanup()
+
+    monkeypatch.setattr(main, "_cleanup_temporary_entries", cleanup_after_writer_stops)
+    payload = (
+      {
+        "cmd": f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}",
+        "cwd": ".",
+        "code_files": {},
+      }
+      if route == "/shell"
+      else {"code": {"probe.py": script}, "evaluation_script": "probe.py"}
+    )
+    payload["timeout"] = 1.0 if exit_code is None else 30
+    try:
+      response = main.app.test_client().post(route, json=payload)
+      failed_evaluation = route == "/run_code" and exit_code != 0
+      assert response.status_code == (400 if failed_evaluation else 200)
+      response_text = response.get_data(as_text=True)
+      assert ("timed" if exit_code is None else "completed") in response_text
+      assert checked
+      assert not artifact.exists()
+      assert helper.poll() is None
+      assert not common_tools.is_contaminated()
+    finally:
+      helper.kill()
+      helper.wait()
+      # Keep a failing test from leaving its detached writer in the test container.
+      if pid_file.exists():
+        pid = int(pid_file.read_text())
+        try:
+          os.kill(pid, signal.SIGKILL)
+          os.waitpid(pid, 0)
+        except (ProcessLookupError, ChildProcessError):
+          pass
 
   def test_excludes_workspace_backup_and_git_trees(self, monkeypatch):
     protected = (
