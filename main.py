@@ -71,8 +71,12 @@ class _TemporaryDirectoryBaseline:
 
 
 # Event bits and record layout from Linux UAPI's <linux/inotify.h>.
+_IN_MODIFY = 0x00000002
+_IN_ATTRIB = 0x00000004
+_IN_MOVED_FROM = 0x00000040
 _IN_MOVED_TO = 0x00000080
 _IN_CREATE = 0x00000100
+_IN_DELETE = 0x00000200
 _IN_DELETE_SELF = 0x00000400
 _IN_MOVE_SELF = 0x00000800
 _IN_UNMOUNT = 0x00002000
@@ -81,15 +85,17 @@ _IN_IGNORED = 0x00008000
 _IN_ONLYDIR = 0x01000000
 _IN_EVENT = struct.Struct("iIII")
 _IN_WATCH_LOST = _IN_DELETE_SELF | _IN_MOVE_SELF | _IN_UNMOUNT | _IN_IGNORED
+_IN_ADDITIONS = _IN_CREATE | _IN_MOVED_TO
+_IN_MUTATIONS = _IN_MODIFY | _IN_ATTRIB | _IN_MOVED_FROM | _IN_DELETE | _IN_ADDITIONS
 
 
 class _TemporaryDirectoryEvents:
-  """Collect changed setup directories through one nonblocking inotify fd.
+  """Select cleanup directories and observe changes to setup entries.
 
   Watches are installed once during startup inventory. Lost coverage closes the
-  event stream; cleanup stops because directory scans cannot establish whether
-  setup file contents changed during the gap. Events arriving during ordinary
-  cleanup remain queued for the next drain.
+  event stream and records contamination; cleanup stops because directory scans
+  cannot establish whether setup file contents changed during the gap. Events
+  arriving during ordinary cleanup remain queued for the next drain.
   """
 
   def __init__(self, fd: int, add_watch):
@@ -122,7 +128,7 @@ class _TemporaryDirectoryEvents:
     descriptor = self._add_watch(
       self.fd,
       os.fsencode(f"/proc/self/fd/{directory_fd}"),
-      _IN_CREATE | _IN_MOVED_TO | _IN_WATCH_LOST | _IN_ONLYDIR,
+      _IN_MUTATIONS | _IN_WATCH_LOST | _IN_ONLYDIR,
     )
     if descriptor < 0:
       error = ctypes.get_errno()
@@ -130,8 +136,16 @@ class _TemporaryDirectoryEvents:
     self.paths[descriptor] = path
 
   def changed_paths(self) -> set[Path] | None:
-    """Return dirty paths, or None when event coverage is unreliable."""
+    """Record setup mutations and select parents that may contain additions.
+
+    Event names are compared with the immutable startup inventory. Writes and
+    removals of new names are expected while producing request artifacts.
+    Mutations of startup names flag contamination without scanning their parent.
+    Directory self-events have no name and describe the watched setup inode.
+    Lost coverage records its reason, closes the watcher, and returns None.
+    """
     if self.fd is None:
+      _record_filesystem_contamination("Filesystem event tracking is unavailable.")
       return None
     dirty = set()
     try:
@@ -145,24 +159,45 @@ class _TemporaryDirectoryEvents:
       offset = 0
       while offset < len(data):
         descriptor, mask, _cookie, length = _IN_EVENT.unpack_from(data, offset)
-        offset += _IN_EVENT.size + length
+        offset += _IN_EVENT.size
+        name = os.fsdecode(data[offset : offset + length].split(b"\0", 1)[0])
+        offset += length
         if offset > len(data):
           raise ValueError("Incomplete inotify event")
         if mask & _IN_Q_OVERFLOW:
+          _record_filesystem_contamination("Filesystem event queue overflowed.")
           logger.warning("Filesystem event queue overflowed; stopping cleanup.")
           self.close()
           return None
         elif mask & _IN_WATCH_LOST:
+          directory = self.paths.get(descriptor)
+          _record_filesystem_contamination(
+            f"Setup directory changed or its watch was lost: {directory}."
+          )
           logger.warning(
             "Setup directory changed or its watch was lost: %s; stopping cleanup.",
-            self.paths.get(descriptor),
+            directory,
           )
           self.close()
           return None
         elif descriptor in self.paths:
-          dirty.add(self.paths[descriptor])
+          directory = self.paths[descriptor]
+          path = directory / name if name else directory
+          if path in _temporary_virtual or any(
+            path.is_relative_to(protected) for protected in _temporary_excluded
+          ):
+            continue
+          baseline = _temporary_baseline.get(directory)
+          if baseline is not None and (not name or name in baseline.entries):
+            if mask & _IN_MUTATIONS:
+              _record_filesystem_contamination(
+                f"Setup filesystem state changed: {path}."
+              )
+          if mask & _IN_ADDITIONS:
+            dirty.add(directory)
       return dirty
     except (OSError, ValueError, struct.error) as exc:
+      _record_filesystem_contamination(f"Filesystem event tracking failed: {exc}.")
       logger.warning("Filesystem event tracking failed; stopping cleanup: %s", exc)
       self.close()
       return None
@@ -181,6 +216,24 @@ _TEMPORARY_DIRS = (Path("/tmp"), Path("/var/tmp"), Path("/dev/shm"))
 # Populated once at startup. Importing this module leaves cleanup disabled.
 _temporary_baseline: dict[Path, _TemporaryDirectoryBaseline] = {}
 _temporary_events: _TemporaryDirectoryEvents | None = None
+_temporary_excluded: frozenset[Path] = frozenset()
+_temporary_virtual: frozenset[Path] = frozenset()
+# Detection is kept separate from process-survivor restarts. Sandbox retirement
+# will consume this sticky reason in a later layer; it has no HTTP effect yet.
+_filesystem_contamination_reason: str | None = None
+
+
+def _record_filesystem_contamination(reason: str) -> None:
+  """Keep and log the first mutation, cleanup failure, or coverage failure.
+
+  The reason lasts until the daemon captures its startup inventory again.
+  Detection uses filesystem events and performs no content hashing. Directory
+  watches have coverage limits, including mmap writes and file bind mounts.
+  """
+  global _filesystem_contamination_reason
+  if _filesystem_contamination_reason is None:
+    _filesystem_contamination_reason = reason
+    logger.warning("Filesystem contamination: %s", reason)
 
 
 @contextmanager
@@ -233,7 +286,9 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
   Absent temporary roots are allowed. Other initialization and inventory errors
   propagate, closing the watcher before the daemon can serve requests.
   """
-  global _temporary_events
+  global _temporary_events, _temporary_excluded, _temporary_virtual
+  global _filesystem_contamination_reason
+  _filesystem_contamination_reason = None
   if _temporary_events is not None:
     _temporary_events.close()
   _temporary_events = None
@@ -253,6 +308,8 @@ def _capture_temporary_baseline() -> dict[Path, _TemporaryDirectoryBaseline]:
     }
     root_directory = _ROOT_DIR.resolve(strict=True)
     virtual = tuple(root_directory / name for name in ("proc", "sys", "dev"))
+    _temporary_excluded = frozenset(excluded)
+    _temporary_virtual = frozenset(virtual)
     temporary = []
     for directory in _TEMPORARY_DIRS:
       try:
@@ -307,7 +364,8 @@ def _cleanup_temporary_entries() -> None:
 
   Events select changed setup directories. Unreliable coverage stops cleanup.
   New trees are removed recursively and symlinks are unlinked; existing file
-  contents are left as written. Failed removals are logged without retrying.
+  changes are recorded and their contents are left as written. Failed removals
+  record contamination without retrying.
   """
   if _temporary_events is None:
     return
@@ -333,10 +391,16 @@ def _cleanup_temporary_entries() -> None:
               # A writer may have removed its own temporary entry already.
               continue
             except OSError as exc:
+              _record_filesystem_contamination(
+                f"New filesystem entry survived cleanup at {root / entry.name}: {exc}."
+              )
               logger.warning(
                 "Could not remove new filesystem entry %s: %s", root / entry.name, exc
               )
     except OSError as exc:
+      _record_filesystem_contamination(
+        f"Could not clean setup directory {root}: {exc}."
+      )
       logger.warning("Could not clean setup directory %s: %s", root, exc)
 
 
